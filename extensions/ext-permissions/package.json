@@ -1,1 +1,13 @@
-{  "name": "yes-my-pi-permissions",  "version": "0.1.0",  "description": "Permission & approval system for yes-my-pi",  "type": "module",  "main": "index.ts"}
+{
+  "name": "yes-my-pi-permissions",
+  "version": "0.1.0",
+  "description": "Permission & approval system for yes-my-pi",
+  "type": "module",
+  "main": "index.ts",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.0"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  }
+}
