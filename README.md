@@ -4,7 +4,7 @@
 
 Pi 是引擎，yes-my-pi 是产品层。不修改 Pi 一行源码，全部通过扩展系统实现。
 
-[![Quality gate status](https://sonarcloud.io/api/project_badges/measure?project=chuyuewei_yes-my-pi&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=chuyuewei_yes-my-pi)
+[![Quality gate](https://sonarcloud.io/api/project_badges/quality_gate?project=chuyuewei_yes-my-pi)](https://sonarcloud.io/summary/new_code?id=chuyuewei_yes-my-pi)
 
 ```
 npm install -g yes-my-pi
