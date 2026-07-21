@@ -1,7 +1,11 @@
 /**
- * yes-my-pi Permission System — Rule Matching Engine
+ * yes-my-pi 权限系统 - 规则匹配引擎
  *
- * Pure functions, no dependency on the Pi API — fully unit-testable in isolation.
+ * 纯函数，不依赖 Pi API，可独立测试。
+ *
+ * 求值优先级：deny > ask > allow
+ * 作用域优先级：project > global > default
+ * 兜底链：YAML 规则 → bash 分类器 → 工具注册表 → defaultAction
  */
 
 import type {
@@ -12,218 +16,244 @@ import type {
   ToolCallInfo,
 } from "./types.js";
 import { classifyBashCommand } from "./bash-analyzer.js";
+import { getToolCategory } from "./tool-registry.js";
 
-// ── Pattern Matching ─────────────────────────────────────
-
-/** Cache of compiled glob patterns to avoid recompiling on every call. */
-const patternRegexCache = new Map<string, RegExp>();
+// ── 通配符匹配 ────────────────────────────────────────────
 
 /**
- * Compiles a glob-like pattern into a cached RegExp.
+ * 简单模式匹配
  *
- * Supported syntax:
- * - `**` matches anything, including path separators (any depth).
- * - `*`  matches anything except `/` (single path segment).
- * - `?`  matches exactly one character except `/`.
- */
-function compileGlobPattern(pattern: string): RegExp {
-  const cached = patternRegexCache.get(pattern);
-  if (cached) return cached;
-
-  const PLACEHOLDER = "\u0000"; // temporary stand-in for "**" during escaping
-
-  const source = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&") // escape regex metacharacters (not *, ?)
-    .replace(/\*\*/g, PLACEHOLDER)
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, "[^/]")
-    .replace(new RegExp(PLACEHOLDER, "g"), ".*");
-
-  const regex = new RegExp(`^${source}$`);
-  patternRegexCache.set(pattern, regex);
-  return regex;
-}
-
-/**
- * Matches a value against a glob-like pattern.
- *
- * Examples:
- *   matchPattern("npm test*", "npm test -- --watch") → true
- *   matchPattern("src/**\/*.ts", "src/foo/bar.ts")     → true
- *   matchPattern("*.ts", "index.ts")                  → true
- *   matchPattern("npm test", "npm test")              → true  (exact)
- *   matchPattern("npm test", "npm test --watch")      → false (no wildcard = exact only)
- *
- * Design note: patterns WITHOUT any `*`/`?` only match exactly. This is a
- * deliberate safety choice for a permission engine — implicit prefix
- * matching (e.g. "src/secret.ts" silently matching "src/secret.ts.bak")
- * is a real risk in security-sensitive config. If prefix matching is
- * desired, the rule author must write it explicitly with a trailing `*`.
+ * 支持：
+ *   "*"           匹配所有
+ *   "npm test*"   前缀通配
+ *   "src/**"      路径 glob（** 跨目录，* 单目录）
+ *   无通配符      精确匹配或前缀匹配
  */
 export function matchPattern(pattern: string, value: string): boolean {
   if (pattern === "*") return true;
-  if (pattern === value) return true; // fast path, no regex needed
 
-  if (pattern.includes("*") || pattern.includes("?")) {
-    return compileGlobPattern(pattern).test(value);
+  // 前缀通配："npm test*" → startsWith("npm test")
+  if (pattern.endsWith("*") && !pattern.includes("**")) {
+    const prefix = pattern.slice(0, -1);
+    return value.startsWith(prefix);
   }
 
-  return false;
+  // 路径 glob：包含 ** 或 *
+  if (pattern.includes("**") || pattern.includes("*")) {
+    const regexStr =
+      "^" +
+      pattern
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&") // 转义正则特殊字符
+        .replace(/\*\*/g, "§GLOBSTAR§") // 保护 **
+        .replace(/\*/g, "[^/]*") // * → 非斜杠
+        .replace(/§GLOBSTAR§/g, ".*") + // ** → 任意
+      "$";
+    try {
+      return new RegExp(regexStr).test(value);
+    } catch {
+      return value.startsWith(pattern);
+    }
+  }
+
+  // 精确匹配或前缀匹配
+  return value === pattern || value.startsWith(pattern);
 }
 
-/** Matches a value against a single pattern or an array of patterns (any-hit = true). */
+/** 匹配字符串或字符串数组（任一命中即 true，undefined 视为不限制） */
 function matchStringOrArray(
-  patterns: string | string[] | undefined,
+  pattern: string | string[] | undefined,
   value: string,
 ): boolean {
-  if (patterns === undefined) return true; // no constraint specified
-  const list = Array.isArray(patterns) ? patterns : [patterns];
-  return list.some((p) => matchPattern(p, value));
+  if (pattern === undefined) return true;
+  const patterns = Array.isArray(pattern) ? pattern : [pattern];
+  return patterns.some((p) => matchPattern(p, value));
 }
 
-/** Reads a tool-call argument as a string, defaulting to "". */
-function argAsString(call: ToolCallInfo, ...keys: string[]): string {
-  for (const key of keys) {
-    const value = call.args[key];
-    if (value !== undefined) return String(value);
-  }
-  return "";
-}
-
-// ── Single Rule Matching ─────────────────────────────────
+// ── 单条规则匹配 ──────────────────────────────────────────
 
 /**
- * Determines whether a single rule matches a given tool call.
+ * 判断一条规则是否匹配给定的工具调用
  */
 export function matchRule(rule: PermissionRule, call: ToolCallInfo): boolean {
-  // 1. Tool name match
+  // 1. 工具名匹配
   if (rule.tool !== "*" && rule.tool !== call.toolName) {
     return false;
   }
 
-  // 2. No `match` clause → matches every call to this tool
+  // 2. 无 match 条件 = 匹配该工具的所有调用
   if (!rule.match) {
     return true;
   }
 
   const { command, path, args } = rule.match;
 
-  // 3. Bash command match
+  // 3. bash 命令匹配
   if (command !== undefined && call.toolName === "bash") {
-    const cmd = argAsString(call, "command");
-    if (!matchStringOrArray(command, cmd)) return false;
+    const cmd = String(call.args.command ?? "");
+    if (!matchStringOrArray(command, cmd)) {
+      return false;
+    }
   }
 
-  // 4. File path match
+  // 4. 文件路径匹配（兼容多种参数名）
   if (path !== undefined) {
-    const filePath = argAsString(call, "path", "file", "filePath");
-    if (!matchStringOrArray(path, filePath)) return false;
+    const filePath = String(
+      call.args.path ?? call.args.file ?? call.args.filePath ?? "",
+    );
+    if (!matchStringOrArray(path, filePath)) {
+      return false;
+    }
   }
 
-  // 5. Generic argument match
+  // 5. 通用参数键值匹配
   if (args !== undefined) {
     for (const [key, pattern] of Object.entries(args)) {
-      const value = argAsString(call, key);
-      if (!matchStringOrArray(pattern, value)) return false;
+      const value = String(call.args[key] ?? "");
+      if (!matchStringOrArray(pattern, value)) {
+        return false;
+      }
     }
   }
 
   return true;
 }
 
-// ── Rule Set Evaluation ───────────────────────────────────
+// ── 动作优先级 ────────────────────────────────────────────
+
+const ACTION_PRIORITY: Record<PermissionAction, number> = {
+  deny: 3,
+  ask: 2,
+  allow: 1,
+};
+
+// ── 单配置求值 ────────────────────────────────────────────
 
 /**
- * Finds the first rule in a list that matches the call and satisfies
- * an optional predicate. Rule order matters — this is what gives users
- * control via ordering (write specific overrides before general rules).
+ * 在单个配置中查找匹配的规则
+ * 同作用域内：deny 优先级最高，先遇到 deny 立即返回
  */
-function findFirstMatchingRule(
-  rules: PermissionRule[],
+function evaluateConfig(
+  config: PermissionConfig,
   call: ToolCallInfo,
-  predicate?: (rule: PermissionRule) => boolean,
-): PermissionRule | undefined {
-  for (const rule of rules) {
+  scope: MatchResult["scope"],
+): MatchResult | undefined {
+  let bestMatch: { rule: PermissionRule; action: PermissionAction } | undefined;
+
+  for (const rule of config.rules) {
     if (!matchRule(rule, call)) continue;
-    if (predicate && !predicate(rule)) continue;
-    return rule;
+
+    if (
+      !bestMatch ||
+      ACTION_PRIORITY[rule.action] > ACTION_PRIORITY[bestMatch.action]
+    ) {
+      bestMatch = { rule, action: rule.action };
+    }
+
+    // deny 是最高优先级，无需继续扫描
+    if (rule.action === "deny") break;
   }
+
+  if (bestMatch) {
+    return {
+      action: bestMatch.action,
+      rule: bestMatch.rule,
+      scope,
+      reason: bestMatch.rule.reason,
+    };
+  }
+
   return undefined;
 }
 
+// ── bash 分类器兜底 ───────────────────────────────────────
+
 /**
- * Generates an implicit result for `bash` tool calls based on the
- * command classifier. Used as a fallback when no explicit YAML rule
- * matches in any scope.
+ * 对 bash 工具调用，基于命令分类生成隐式规则
+ * 当 YAML 中没有显式 bash 规则命中时使用
  */
 function evaluateBashClassifier(call: ToolCallInfo): MatchResult | undefined {
   if (call.toolName !== "bash") return undefined;
 
-  const cmd = argAsString(call, "command");
+  const cmd = String(call.args.command ?? "");
   const cls = classifyBashCommand(cmd);
-  const preview = cmd.slice(0, 80);
+  const cmdPreview = cmd.length > 80 ? cmd.slice(0, 80) + "…" : cmd;
 
   switch (cls) {
     case "dangerous":
       return {
         action: "deny",
         scope: "default",
-        reason: `Command classified as dangerous: "${preview}"`,
+        reason: `命令被分类为危险操作: "${cmdPreview}"`,
       };
     case "write":
     case "unknown":
       return {
         action: "ask",
         scope: "default",
-        reason: `Command contains a write operation or could not be classified: "${preview}"`,
+        reason: `命令包含写操作或无法判断: "${cmdPreview}"`,
       };
     case "read":
-      return { action: "allow", scope: "default", reason: undefined };
+      return {
+        action: "allow",
+        scope: "default",
+      };
   }
 }
 
-interface ScopedConfig {
-  scope: MatchResult["scope"];
-  config: PermissionConfig;
-}
-
-/** Collects present configs in cascade priority order: project > global > default. */
-function collectScopedConfigs(configs: {
-  project?: PermissionConfig;
-  global?: PermissionConfig;
-  default?: PermissionConfig;
-}): ScopedConfig[] {
-  const scopes: ScopedConfig[] = [];
-  if (configs.project)
-    scopes.push({ scope: "project", config: configs.project });
-  if (configs.global) scopes.push({ scope: "global", config: configs.global });
-  if (configs.default)
-    scopes.push({ scope: "default", config: configs.default });
-  return scopes;
-}
+// ── 工具注册表兜底 ────────────────────────────────────────
 
 /**
- * Main entry point: evaluates a tool call against all configuration layers.
+ * 对非 bash 工具，基于注册表分类推断默认动作
+ * 当 YAML 规则未命中时使用
+ */
+function evaluateToolRegistry(call: ToolCallInfo): MatchResult | undefined {
+  if (call.toolName === "bash") return undefined; // bash 有自己的分类器
+
+  const category = getToolCategory(call.toolName);
+
+  switch (category) {
+    case "read":
+      return {
+        action: "allow",
+        scope: "default",
+      };
+    case "write":
+      return {
+        action: "ask",
+        scope: "default",
+        reason: `写操作工具 "${call.toolName}" 需要确认`,
+      };
+    case "mixed":
+      return {
+        action: "ask",
+        scope: "default",
+        reason: `混合工具 "${call.toolName}" 需要确认`,
+      };
+    case "unknown":
+      return {
+        action: "ask",
+        scope: "default",
+        reason:
+          `未分类工具 "${call.toolName}"（可能来自扩展），默认需要确认。` +
+          `可在 permissions.yaml 中添加规则。`,
+      };
+  }
+}
+
+// ── 主入口 ────────────────────────────────────────────────
+
+/**
+ * 对工具调用求值
  *
- * Resolution model (two passes):
+ * 求值链（按顺序，取最严格结果）：
+ *   1. project 配置（项目级 .pi/permissions.yaml）
+ *   2. global 配置（全局 ~/.pi/agent/permissions.yaml）
+ *   3. default 配置（出厂 permissions.default.yaml）
+ *   4. bash 分类器兜底（仅 bash 工具）
+ *   5. 工具注册表兜底（非 bash 工具）
+ *   6. defaultAction 最终兜底
  *
- * **Pass 1 — Deny is an absolute floor.** If *any* scope (project, global,
- * or default) has a rule matching the call with `action: "deny"`, the call
- * is denied immediately. No scope — not even project — can override a deny
- * set by a broader scope. This mirrors admin-enforced hard limits.
- *
- * **Pass 2 — Cascading override for non-deny actions.** Scopes are checked
- * in priority order (project → global → default). Within each scope, the
- * *first* rule that matches wins (rule order is significant — put specific
- * overrides before general rules). This lets a project explicitly relax a
- * global "ask" to "allow" (or tighten it), as long as it doesn't conflict
- * with an established deny.
- *
- * **Pass 3 — Bash classifier fallback.** Only used for `bash` calls with
- * no explicit rule match in any scope.
- *
- * **Pass 4 — `defaultAction` fallback.** Falls back through
- * project → global → default `defaultAction`, defaulting to `"ask"`.
+ * 跨来源取最严格：deny > ask > allow
  */
 export function evaluateToolCall(
   call: ToolCallInfo,
@@ -233,38 +263,40 @@ export function evaluateToolCall(
     default?: PermissionConfig;
   },
 ): MatchResult {
-  const scopes = collectScopedConfigs(configs);
+  const results: MatchResult[] = [];
 
-  // Pass 1: deny floor — checked across ALL scopes before anything else.
-  for (const { scope, config } of scopes) {
-    const denyRule = findFirstMatchingRule(
-      config.rules,
-      call,
-      (r) => r.action === "deny",
-    );
-    if (denyRule) {
-      return { action: "deny", rule: denyRule, scope, reason: denyRule.reason };
-    }
+  // 1-3. YAML 规则（按作用域）
+  if (configs.project) {
+    const r = evaluateConfig(configs.project, call, "project");
+    if (r) results.push(r);
+  }
+  if (configs.global) {
+    const r = evaluateConfig(configs.global, call, "global");
+    if (r) results.push(r);
+  }
+  if (configs.default) {
+    const r = evaluateConfig(configs.default, call, "default");
+    if (r) results.push(r);
   }
 
-  // Pass 2: cascading first-match-wins per scope, in priority order.
-  for (const { scope, config } of scopes) {
-    const rule = findFirstMatchingRule(config.rules, call);
-    if (rule) {
-      return { action: rule.action, rule, scope, reason: rule.reason };
-    }
-  }
-
-  // Pass 3: bash classifier fallback.
+  // 4. bash 分类器兜底
   const bashResult = evaluateBashClassifier(call);
-  if (bashResult) return bashResult;
+  if (bashResult) results.push(bashResult);
 
-  // Pass 4: defaultAction fallback (project overrides global overrides default).
-  const fallbackAction: PermissionAction =
-    configs.project?.defaultAction ??
-    configs.global?.defaultAction ??
-    configs.default?.defaultAction ??
-    "ask";
+  // 5. 工具注册表兜底
+  const registryResult = evaluateToolRegistry(call);
+  if (registryResult) results.push(registryResult);
 
-  return { action: fallbackAction, scope: "default", reason: undefined };
+  // 6. 无结果 → defaultAction
+  if (results.length === 0) {
+    const defaultAction = configs.default?.defaultAction ?? "ask";
+    return {
+      action: defaultAction,
+      scope: "default",
+    };
+  }
+
+  // 取最严格结果
+  results.sort((a, b) => ACTION_PRIORITY[b.action] - ACTION_PRIORITY[a.action]);
+  return results[0];
 }

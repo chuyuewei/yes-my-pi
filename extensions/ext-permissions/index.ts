@@ -1,85 +1,80 @@
 /**
- * yes-my-pi Permission System — Pi Extension Entry Point
+ * yes-my-pi 权限系统 - Pi 扩展入口
  *
- * Integrates the rule engine + approval mode into Pi's tool_call event.
+ * 将规则引擎（T3）+ 审批模式（T4）+ 边界处理（T5）
+ * 接入 Pi 的 tool_call 事件。
  *
- * Hooks:
- *   - tool_call event : intercepts tool calls, evaluates permissions
- *   - /mode command   : switches approval mode
- *   - /permissions cmd: views current rules and session overrides
- *   - Status bar      : displays the active mode
+ * 挂载点：
+ *   - tool_call   ：拦截工具调用，执行权限求值
+ *   - /mode       ：切换审批模式
+ *   - /permissions：查看规则与状态
+ *   - 状态栏      ：显示当前模式
+ *
+ * 铁律：deny 在任何模式下都不可覆盖。
  */
 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
 import { evaluateToolCall } from "./src/matcher.js";
 import { loadAllConfigs, watchConfigs, type ConfigSet } from "./src/loader.js";
 import {
   ModeManager,
   applyMode,
   MODE_DESCRIPTIONS,
+  MODE_ICONS,
   ALL_MODES,
+  type ApprovalMode,
 } from "./src/mode.js";
+import { getToolInfo } from "./src/tool-registry.js";
 import type { ToolCallInfo, MatchResult } from "./src/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// ── Path Resolution ───────────────────────────────────────
+// ── 常量 ──────────────────────────────────────────────────
+
+const MAX_ARGS_DISPLAY = 200;
+
+// ── 配置路径 ──────────────────────────────────────────────
 
 function getConfigPaths() {
-  const home = homedir();
-  const cwd = process.cwd();
-
   return {
-    // Factory default rules (distributed with the extension)
+    /** 出厂默认规则（随扩展包分发） */
     default: join(__dirname, "permissions.default.yaml"),
-
-    // Global user rules (~/.pi/agent/permissions.yaml)
-    global: join(home, ".pi", "agent", "permissions.yaml"),
-
-    // Project-level rules (<project>/.pi/permissions.yaml)
-    project: join(cwd, ".pi", "permissions.yaml"),
+    /** 全局用户规则 */
+    global: join(homedir(), ".pi", "agent", "permissions.yaml"),
+    /** 项目级规则 */
+    project: join(process.cwd(), ".pi", "permissions.yaml"),
   };
 }
 
-// ── Session Overrides ─────────────────────────────────────
+// ── 会话级临时覆盖 ────────────────────────────────────────
 
 interface SessionOverrides {
-  /** Operations always allowed in this session */
+  /** 本会话内始终允许的工具 */
   alwaysAllow: Set<string>;
-  /** Operations always denied in this session */
+  /** 本会话内始终拒绝的工具 */
   alwaysDeny: Set<string>;
 }
 
-/**
- * Generates a unique signature for a specific tool call, used as the key
- * for session-level overrides. This scopes "always allow/deny" to the
- * exact command/path rather than the whole tool name, preventing a user's
- * "always allow" on `npm test` from accidentally allowing `rm -rf /`.
- */
-function getCallSignature(call: ToolCallInfo): string {
-  const args = call.args;
+// ── 并发确认队列 ──────────────────────────────────────────
+// Pi 可能并行调用多个工具，确认框必须串行显示
 
-  if (call.toolName === "bash" && typeof args.command === "string") {
-    return `${call.toolName}:${args.command}`;
-  }
+let confirmQueue: Promise<unknown> = Promise.resolve();
 
-  const pathKey = ["path", "file", "filePath"].find(
-    (k) => typeof args[k] === "string",
-  );
-  if (pathKey) {
-    return `${call.toolName}:${args[pathKey]}`;
-  }
-
-  return `${call.toolName}:${JSON.stringify(args)}`;
+function enqueueConfirm<T>(fn: () => Promise<T>): Promise<T> {
+  const result = confirmQueue.then(fn, fn);
+  confirmQueue = result.catch(() => {});
+  return result;
 }
 
-// ── Extension Main ────────────────────────────────────────
+// ── 扩展主体 ──────────────────────────────────────────────
 
 export default function extPermissions(pi: ExtensionAPI): void {
-  // 1. Initialization
+  // ── 初始化 ────────────────────────────────────────────
+
   const paths = getConfigPaths();
   let configs: ConfigSet = loadAllConfigs(paths);
   const modeManager = new ModeManager("auto-edit");
@@ -87,18 +82,23 @@ export default function extPermissions(pi: ExtensionAPI): void {
     alwaysAllow: new Set(),
     alwaysDeny: new Set(),
   };
+  const loggedUnknownTools = new Set<string>();
 
-  // 2. Set initial status bar
-  pi.on("session_start", () => {
-    updateStatus();
+  // ── 生命周期 ──────────────────────────────────────────
+
+  pi.on("session_start", (_event: unknown, ctx: any) => {
+    updateStatus(ctx);
   });
 
-  // 3. Watch for configuration hot-reloads
   const stopWatching = watchConfigs(
     { global: paths.global, project: paths.project },
     (newConfigs) => {
       configs = { ...newConfigs, default: configs.default };
-      pi.appendSystemMessage?.("[ymp] Permission configurations reloaded.");
+      try {
+        pi.appendSystemMessage?.("[ymp] 权限配置已重新加载。");
+      } catch {
+        // 静默忽略
+      }
     },
   );
 
@@ -106,46 +106,55 @@ export default function extPermissions(pi: ExtensionAPI): void {
     stopWatching();
   });
 
-  // ── Core: tool_call Interceptor ─────────────────────────
+  // ── 核心：tool_call 拦截器 ────────────────────────────
 
-  pi.on("tool_call", async (event, ctx) => {
+  pi.on("tool_call", async (event: any, ctx: any) => {
     const call: ToolCallInfo = {
       toolName: event.toolName,
       args: (event.args ?? {}) as Record<string, unknown>,
     };
-    const signature = getCallSignature(call);
 
-    // 3a. Rule Engine Evaluation. Deny is an absolute floor.
-    // We must evaluate rules FIRST so that session overrides cannot
-    // bypass a hard `deny` set by config.
+    // 1. 会话级临时覆盖（最高优先级）
+    if (overrides.alwaysDeny.has(call.toolName)) {
+      return {
+        blocked: true,
+        reason: `[ymp] 工具 "${call.toolName}" 在本会话中已被标记为始终拒绝。请调整方案。`,
+      };
+    }
+
+    if (overrides.alwaysAllow.has(call.toolName)) {
+      return; // 放行
+    }
+
+    // 2. 规则引擎求值
     const matchResult: MatchResult = evaluateToolCall(call, configs);
 
-    if (matchResult.action === "deny") {
-      return {
-        blocked: true,
-        reason: formatDenyReason(call, matchResult),
-      };
+    // 3. 未知工具日志（仅首次）
+    const toolInfo = getToolInfo(call.toolName);
+    if (toolInfo.category === "unknown" && !toolInfo.builtin) {
+      if (!loggedUnknownTools.has(call.toolName)) {
+        loggedUnknownTools.add(call.toolName);
+        try {
+          pi.appendSystemMessage?.(
+            `[ymp] 检测到未分类工具 "${call.toolName}"（来自扩展）。` +
+              `默认需要确认。可在 permissions.yaml 中添加规则。`,
+          );
+        } catch {
+          // 静默忽略
+        }
+      }
     }
 
-    // 3b. Check session-level overrides for this exact operation
-    if (overrides.alwaysDeny.has(signature)) {
-      return {
-        blocked: true,
-        reason: `[ymp] Operation "${signature}" marked as always deny in this session.`,
-      };
-    }
-
-    if (overrides.alwaysAllow.has(signature)) {
-      return; // Allow bypassing the mode/ask prompt
-    }
-
-    // 3c. Apply current Approval Mode mapping
+    // 4. 审批模式二次映射
     const finalAction = applyMode(modeManager.mode, matchResult.action);
 
-    // 3d. Execute action
+    // 5. 更新状态栏
+    updateStatus(ctx);
+
+    // 6. 执行动作
     switch (finalAction) {
       case "allow":
-        return; // Pass through, do not block
+        return; // 放行
 
       case "deny":
         return {
@@ -154,183 +163,222 @@ export default function extPermissions(pi: ExtensionAPI): void {
         };
 
       case "ask": {
-        const approved = await askUser(call, matchResult, ctx);
-        if (approved === "allow") return;
-        if (approved === "always-allow") {
-          overrides.alwaysAllow.add(signature);
-          return;
+        const decision = await askUser(call, matchResult, ctx);
+
+        switch (decision) {
+          case "allow":
+            return; // 放行
+
+          case "always-allow":
+            overrides.alwaysAllow.add(call.toolName);
+            return; // 放行
+
+          case "always-deny":
+            overrides.alwaysDeny.add(call.toolName);
+            return {
+              blocked: true,
+              reason: `[ymp] 工具 "${call.toolName}" 已被标记为始终拒绝。请调整方案。`,
+            };
+
+          case "deny":
+          default:
+            return {
+              blocked: true,
+              reason: `[ymp] 用户拒绝了 ${call.toolName} 操作。请调整方案或使用替代方法，不要重试相同操作。`,
+            };
         }
-        if (approved === "always-deny") {
-          overrides.alwaysDeny.add(signature);
-          return {
-            blocked: true,
-            reason: `[ymp] Operation "${signature}" marked as always deny in this session.`,
-          };
-        }
-        // "deny"
-        return {
-          blocked: true,
-          reason: `[ymp] User denied the ${call.toolName} operation. Adjust your approach or use an alternative method.`,
-        };
       }
     }
   });
 
-  // ── User Confirmation Dialog ────────────────────────────
+  // ── 用户确认交互 ──────────────────────────────────────
+
+  type UserDecision = "allow" | "deny" | "always-allow" | "always-deny";
 
   async function askUser(
     call: ToolCallInfo,
     match: MatchResult,
     ctx: any,
-  ): Promise<"allow" | "deny" | "always-allow" | "always-deny"> {
-    const argsSummary = formatArgsSummary(call);
-    const message =
-      `⚠️  ${call.toolName}\n` +
-      `   ${argsSummary}\n` +
-      (match.reason ? `   Rule: ${match.reason}\n` : "") +
-      `   Mode: ${modeManager.mode} | Scope: ${match.scope}`;
+  ): Promise<UserDecision> {
+    // 通过队列串行化，避免多个确认框同时弹出
+    return enqueueConfirm(async () => {
+      const argsSummary = formatArgsSummary(call);
+      const message = [
+        `⚠️  ${call.toolName}`,
+        `   ${argsSummary}`,
+        match.reason ? `   规则: ${match.reason}` : null,
+        `   模式: ${modeManager.mode} | 来源: ${match.scope}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
 
-    try {
-      // Attempt to use Pi's confirmation UI
-      if (ctx?.ui?.confirm) {
-        const result = await ctx.ui.confirm(message, {
-          choices: [
-            { key: "y", label: "Allow once", value: "allow" },
-            { key: "n", label: "Deny once", value: "deny" },
-            {
-              key: "a",
-              label: "Always allow this operation this session",
-              value: "always-allow",
-            },
-            {
-              key: "d",
-              label: "Always deny this operation this session",
-              value: "always-deny",
-            },
-          ],
-        });
-        return result ?? "deny";
+      try {
+        // 尝试使用 Pi 的确认 UI
+        if (ctx?.ui?.confirm) {
+          const result = await ctx.ui.confirm(message, {
+            choices: [
+              { key: "y", label: "允许本次", value: "allow" },
+              { key: "n", label: "拒绝本次", value: "deny" },
+              {
+                key: "a",
+                label: "本会话始终允许此工具",
+                value: "always-allow",
+              },
+              { key: "d", label: "本会话始终拒绝此工具", value: "always-deny" },
+            ],
+          });
+          if (
+            result === "allow" ||
+            result === "deny" ||
+            result === "always-allow" ||
+            result === "always-deny"
+          ) {
+            return result;
+          }
+        }
+      } catch {
+        // ctx.ui.confirm 不可用、用户按了 Escape、或 API 签名不匹配
+        // 降级为默认拒绝（安全优先）
       }
-    } catch {
-      // ctx.ui.confirm unavailable or user pressed Escape
-    }
 
-    // Fallback: default to deny (safety-first)
-    return "deny";
+      return "deny";
+    });
   }
 
-  // ── Command Registration ────────────────────────────────
+  // ── 命令：/mode ───────────────────────────────────────
 
-  // /mode - Switch approval mode
   pi.registerCommand("mode", {
-    description: `Switch approval mode (${ALL_MODES.join(" | ")})`,
-    handler: async (args: string) => {
+    description: `切换审批模式 (${ALL_MODES.join(" | ")})`,
+    handler: async (args: string, ctx: any) => {
       const target = args?.trim().toLowerCase();
 
-      // No args: show current mode
+      // 无参数：显示当前模式
       if (!target) {
         const lines = ALL_MODES.map((m) => {
-          const active = m === modeManager.mode ? " ← current" : "";
-          return `  ${m === modeManager.mode ? "●" : "○"} ${m}: ${MODE_DESCRIPTIONS[m]}${active}`;
+          const active = m === modeManager.mode;
+          const icon = active ? "●" : "○";
+          const suffix = active ? " ← 当前" : "";
+          return `  ${icon} ${MODE_ICONS[m]} ${m}: ${MODE_DESCRIPTIONS[m]}${suffix}`;
         });
-        return `Approval Modes:\n${lines.join("\n")}\n\nUsage: /mode <${ALL_MODES.join("|")}>`;
+        return [
+          "审批模式:",
+          ...lines,
+          "",
+          `用法: /mode <${ALL_MODES.join(" | ")}>`,
+        ].join("\n");
       }
 
-      // Has args: switch mode
-      try {
-        modeManager.setMode(target as any);
-        updateStatus();
-        return `✅ Approval mode switched to: ${modeManager.statusText}\n   ${MODE_DESCRIPTIONS[modeManager.mode]}`;
-      } catch (err) {
-        return `❌ ${err instanceof Error ? err.message : err}`;
+      // 有参数：切换模式
+      if (!ALL_MODES.includes(target as ApprovalMode)) {
+        return `❌ 无效模式 "${target}"。可选: ${ALL_MODES.join(" | ")}`;
       }
+
+      modeManager.setMode(target as ApprovalMode);
+      updateStatus(ctx);
+
+      return [
+        `✅ 审批模式已切换为: ${MODE_ICONS[modeManager.mode]} ${modeManager.mode}`,
+        `   ${MODE_DESCRIPTIONS[modeManager.mode]}`,
+      ].join("\n");
     },
   });
 
-  // /permissions - View permission status
+  // ── 命令：/permissions ────────────────────────────────
+
   pi.registerCommand("permissions", {
-    description: "View current permission rules and session overrides",
-    handler: async () => {
+    description: "查看当前权限规则与会话状态",
+    handler: async (_args: string, _ctx: any) => {
       const lines: string[] = [];
 
-      lines.push(`Mode: ${modeManager.statusText}`);
+      // 当前模式
+      lines.push(`模式: ${MODE_ICONS[modeManager.mode]} ${modeManager.mode}`);
+      lines.push(`  ${MODE_DESCRIPTIONS[modeManager.mode]}`);
       lines.push("");
 
-      // Config sources
-      lines.push("Config Sources:");
+      // 配置来源
+      lines.push("配置来源:");
       lines.push(
-        `  Default rules: ${configs.default ? `${configs.default.rules.length} rules` : "Not loaded"}`,
+        `  默认规则: ${configs.default ? `${configs.default.rules.length} 条` : "未加载"}`,
       );
       lines.push(
-        `  Global rules:  ${configs.global ? `${configs.global.rules.length} rules (${paths.global})` : "None"}`,
+        `  全局规则: ${configs.global ? `${configs.global.rules.length} 条` : "无"} (${paths.global})`,
       );
       lines.push(
-        `  Project rules: ${configs.project ? `${configs.project.rules.length} rules (${paths.project})` : "None"}`,
+        `  项目规则: ${configs.project ? `${configs.project.rules.length} 条` : "无"} (${paths.project})`,
       );
       lines.push("");
 
-      // Session overrides
-      if (overrides.alwaysAllow.size > 0 || overrides.alwaysDeny.size > 0) {
-        lines.push("Session Overrides:");
-        if (overrides.alwaysAllow.size > 0) {
-          lines.push("  Always Allow:");
-          [...overrides.alwaysAllow].forEach((s) => lines.push(`    - ${s}`));
-        }
-        if (overrides.alwaysDeny.size > 0) {
-          lines.push("  Always Deny:");
-          [...overrides.alwaysDeny].forEach((s) => lines.push(`    - ${s}`));
-        }
-      } else {
-        lines.push("Session Overrides: None");
+      // 会话覆盖
+      lines.push("会话覆盖:");
+      if (overrides.alwaysAllow.size > 0) {
+        lines.push(`  始终允许: ${[...overrides.alwaysAllow].join(", ")}`);
+      }
+      if (overrides.alwaysDeny.size > 0) {
+        lines.push(`  始终拒绝: ${[...overrides.alwaysDeny].join(", ")}`);
+      }
+      if (overrides.alwaysAllow.size === 0 && overrides.alwaysDeny.size === 0) {
+        lines.push("  无临时覆盖");
+      }
+      lines.push("");
+
+      // 未分类工具
+      if (loggedUnknownTools.size > 0) {
+        lines.push(`未分类工具: ${[...loggedUnknownTools].join(", ")}`);
+        lines.push("  提示: 在 permissions.yaml 中为这些工具添加规则");
       }
 
       return lines.join("\n");
     },
   });
 
-  // ── Status Bar ──────────────────────────────────────────
+  // ── 状态栏 ────────────────────────────────────────────
 
-  function updateStatus(): void {
+  function updateStatus(ctx?: any): void {
+    const text = `${MODE_ICONS[modeManager.mode]} ${modeManager.mode}`;
     try {
-      // Pi's ctx.ui.setStatus or equivalent API
-      pi.setStatus?.(modeManager.statusText);
+      if (ctx?.ui?.setStatus) {
+        ctx.ui.setStatus(text);
+      }
     } catch {
-      // Ignore silently if status bar API is unavailable
+      // 状态栏 API 不可用时静默忽略
     }
   }
 
-  // Update status bar on mode change
-  modeManager.onChange(() => {
-    updateStatus();
-  });
-
-  // ── Helpers ─────────────────────────────────────────────
+  // ── 辅助函数 ──────────────────────────────────────────
 
   function formatDenyReason(call: ToolCallInfo, match: MatchResult): string {
-    const base =
-      match.reason ?? `Tool "${call.toolName}" blocked by permission rules`;
-    return `[ymp] ${base}. Adjust your approach, do not retry the exact same operation.`;
+    const base = match.reason ?? `工具 "${call.toolName}" 被权限规则拒绝`;
+    return `[ymp] ${base}。请调整方案，不要重试相同操作。`;
   }
 
   function formatArgsSummary(call: ToolCallInfo): string {
     const args = call.args;
+    let summary: string;
 
-    // bash: show command
+    // bash：显示命令
     if (call.toolName === "bash" && typeof args.command === "string") {
-      const cmd = args.command as string;
-      return cmd.length > 120 ? cmd.slice(0, 120) + "…" : cmd;
+      summary = args.command;
+    } else {
+      // 文件工具：显示路径
+      const pathKey = ["path", "file", "filePath"].find(
+        (k) => typeof args[k] === "string",
+      );
+      if (pathKey) {
+        summary = String(args[pathKey]);
+      } else {
+        // 其他：JSON 摘要
+        try {
+          summary = JSON.stringify(args);
+        } catch {
+          summary = String(args);
+        }
+      }
     }
 
-    // File tools: show path
-    const pathKey = ["path", "file", "filePath"].find(
-      (k) => typeof args[k] === "string",
-    );
-    if (pathKey) {
-      return String(args[pathKey]);
+    // 截断
+    if (summary.length > MAX_ARGS_DISPLAY) {
+      return `${summary.slice(0, MAX_ARGS_DISPLAY)}… (${summary.length} chars)`;
     }
-
-    // Others: show JSON summary
-    const json = JSON.stringify(args);
-    return json.length > 120 ? json.slice(0, 120) + "…" : json;
+    return summary;
   }
 }

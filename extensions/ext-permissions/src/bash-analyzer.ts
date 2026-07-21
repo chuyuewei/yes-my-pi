@@ -1,50 +1,76 @@
 /**
- * yes-my-pi Permission System - Bash Command Classifier
+ * yes-my-pi 权限系统 - bash 命令分类器（v2 加固版）
  *
- * Classifies bash commands into read / write / dangerous / unknown.
- * Does not perform full shell parsing; uses prefix matching + structural
- * analysis to cover 80% of scenarios. When uncertain, defaults to write
- * (safety-first, triggers user approval).
+ * v2 改进：
+ *   - 引号内的管道/链式操作符不再误拆分
+ *   - 检测命令替换 $() 和反引号
+ *   - 检测 env 变量前缀 (FOO=bar cmd)
+ *   - 检测 find -exec / xargs 嵌套命令
+ *   - 检测 bash -c / sh -c 嵌套命令
+ *   - 新增 Windows PowerShell / cmd.exe 命令分类
+ *   - 脚本执行 (node -e, python -c) 归类为 write
  */
 
 export type BashCommandClass = "read" | "write" | "dangerous" | "unknown";
 
-/** Read-only command prefixes */
+// ── 只读命令白名单 ────────────────────────────────────────
+
 const READ_ONLY_COMMANDS: string[] = [
-  "cat",
-  "head",
-  "tail",
-  "less",
-  "more",
-  "wc",
-  "ls",
-  "ll",
-  "dir",
+  // 文件查看
+  "cat ",
+  "head ",
+  "tail ",
+  "less ",
+  "more ",
+  "wc ",
+  "file ",
+  "stat ",
+  "du ",
+  "df ",
+  // 目录
+  "ls ",
+  "ll ",
+  "dir ",
+  "tree ",
   "pwd",
-  "which",
-  "where",
-  "whereis",
-  "echo",
-  "printf",
-  "grep",
-  "egrep",
-  "fgrep",
-  "rg",
-  "ag",
-  "find",
-  "fd",
-  "locate",
-  "file",
-  "stat",
-  "du",
-  "df",
+  // 搜索
+  "grep ",
+  "egrep ",
+  "fgrep ",
+  "rg ",
+  "ag ",
+  "find ",
+  "fd ",
+  "locate ",
+  // 系统信息
+  "which ",
+  "where ",
+  "whereis ",
+  "type ",
+  "command -v ",
+  "echo ",
+  "printf ",
   "env",
   "printenv",
   "date",
-  "uname",
+  "uname ",
   "hostname",
   "whoami",
-  "id",
+  "id ",
+  // 文本处理（只读用法）
+  "sort ",
+  "uniq ",
+  "cut ",
+  "tr ",
+  "jq ",
+  "yq ",
+  "diff ",
+  "comm ",
+  "realpath ",
+  "readlink ",
+  "basename ",
+  "dirname ",
+  // 版本查询
   "node -v",
   "node --version",
   "npm -v",
@@ -53,12 +79,23 @@ const READ_ONLY_COMMANDS: string[] = [
   "npm ls",
   "npm outdated",
   "npm view",
+  "npm search",
   "npx --version",
   "python --version",
   "python3 --version",
   "pip list",
   "pip show",
   "pip3 list",
+  "pip3 show",
+  "cargo --version",
+  "rustc --version",
+  "go version",
+  "go env",
+  "java -version",
+  "javac -version",
+  "tsc --version",
+  "eslint --version",
+  // Git 只读
   "git status",
   "git log",
   "git diff",
@@ -70,84 +107,125 @@ const READ_ONLY_COMMANDS: string[] = [
   "git ls-files",
   "git blame",
   "git stash list",
-  "cargo --version",
-  "rustc --version",
-  "go version",
-  "go env",
-  "java -version",
-  "javac -version",
-  "tsc --version",
-  "eslint --version",
-  "tree",
-  "realpath",
-  "readlink",
-  "sort",
-  "uniq",
-  "cut",
-  "tr",
-  "awk",
-  "sed -n",
-  "jq",
-  "yq",
-  "curl -s",
-  "wget -q -O -",
-  "type",
-  "command -v",
-  "test",
-  "[",
+  "git shortlog",
+  "git describe",
+  "git config --get",
+  "git config --list",
+  // 测试/构建（只读验证）
+  "npm test",
+  "npm run test",
+  "npm run lint",
+  "npm run check",
+  "npm run typecheck",
+  "npx vitest",
+  "npx jest",
+  "npx tsc --noEmit",
+  "npx eslint",
+  "npx prettier --check",
+  "pytest",
+  "cargo test",
+  "cargo clippy",
+  "go test",
+  "go vet",
+  "make test",
+  "make lint",
+  "make check",
+  // 其他
+  "test ",
+  "[ ",
   "true",
   "false",
+  "sleep ", // 无副作用
 ];
 
-/** Dangerous command prefixes (deny in all modes) */
-const DANGEROUS_COMMAND_PREFIXES: string[] = [
+// ── 危险命令黑名单 ────────────────────────────────────────
+
+const DANGEROUS_COMMANDS: string[] = [
+  // 文件系统破坏
   "rm -rf /",
   "rm -rf /*",
   "rm -rf ~",
   "rm -rf ~/",
   "rm -rf .",
   "rm -rf ./",
-  "sudo",
-  "su",
+  "rm -rf ..",
+  "rm -rf ../",
+  // 权限提升
+  "sudo ",
+  "su ",
+  "doas ",
+  // 远程代码执行
+  "curl | bash",
+  "curl | sh",
+  "wget | bash",
+  "wget | sh",
+  "curl|bash",
+  "curl|sh",
+  "wget|bash",
+  "wget|sh",
+  "curl |bash",
+  "curl |sh",
+  // 权限破坏
   "chmod 777",
   "chmod -R 777",
   "chown -R",
+  // 磁盘破坏
   "dd if=",
   "mkfs",
   "fdisk",
+  "parted ",
+  // Fork bomb
+  ":(){ :|:& };:",
+  // 设备覆写
   "> /dev/sda",
   "> /dev/nvme",
+  "> /dev/disk",
+  // 系统控制
   "shutdown",
   "reboot",
   "halt",
   "poweroff",
+  "init 0",
+  "init 6",
+  // 进程破坏
   "kill -9 1",
   "killall",
+  // 防火墙
   "iptables",
-  "ufw",
+  "ufw ",
+  "nft ",
+  // 服务控制
   "systemctl stop",
   "systemctl disable",
   "service stop",
+  // Windows 危险命令
+  "format ",
+  "del /s /q ",
+  "rd /s /q ",
+  "Remove-Item -Recurse -Force C:",
+  "diskpart",
+  "reg delete ",
+  "net stop ",
+  "sc delete ",
+  "Stop-Computer",
+  "Restart-Computer",
 ];
 
-/** Dangerous command regex patterns (for complex syntax like pipes) */
-const DANGEROUS_COMMAND_REGEXES: RegExp[] = [
-  /(?:curl|wget)\s+.*\|\s*(?:bash|sh)/, // curl | bash variations
-  /:\s*\(\)\s*\{\s*:\|:\&\s*\}\s*;\s*:/, // fork bomb :(){ :|:& };:
-];
+// ── 写操作命令 ────────────────────────────────────────────
 
-/** Write command prefixes (triggers ask in auto-edit mode) */
 const WRITE_COMMANDS: string[] = [
-  "rm",
-  "rmdir",
-  "mv",
-  "cp",
-  "mkdir",
-  "touch",
-  "chmod",
-  "chown",
-  "ln",
-  "tee",
+  // 文件操作
+  "rm ",
+  "rmdir ",
+  "mv ",
+  "cp ",
+  "mkdir ",
+  "touch ",
+  "ln ",
+  "chmod ",
+  "chown ",
+  "tee ",
+  // Git 写操作
   "git add",
   "git commit",
   "git push",
@@ -161,13 +239,19 @@ const WRITE_COMMANDS: string[] = [
   "git stash push",
   "git stash pop",
   "git stash drop",
-  "git tag",
+  "git stash clear",
+  "git tag ",
   "git branch -d",
   "git branch -D",
   "git remote add",
   "git remote remove",
+  "git remote set-url",
+  "git config --set",
+  "git config --add",
+  "git clean",
+  // 包管理
   "npm install",
-  "npm i",
+  "npm i ",
   "npm ci",
   "npm uninstall",
   "npm remove",
@@ -175,6 +259,7 @@ const WRITE_COMMANDS: string[] = [
   "npm link",
   "npm run build",
   "npm run compile",
+  "npm cache clean",
   "npx create-",
   "yarn add",
   "yarn remove",
@@ -187,153 +272,315 @@ const WRITE_COMMANDS: string[] = [
   "pip uninstall",
   "cargo build",
   "cargo install",
+  "cargo publish",
   "go build",
   "go install",
   "go get",
-  "make",
-  "cmake",
+  // 构建
+  "make ",
+  "cmake ",
+  "gradle ",
+  "mvn ",
+  "tsc ",
+  "webpack ",
+  "vite build",
+  "rollup ",
+  // 容器/部署
   "docker build",
   "docker run",
   "docker push",
   "docker compose up",
   "docker-compose up",
+  "docker rm",
+  "docker rmi",
   "kubectl apply",
   "kubectl delete",
   "terraform apply",
   "terraform destroy",
-  "apt",
-  "apt-get",
-  "yum",
-  "brew",
-  "wget",
-  "curl -o",
-  "curl -O",
-  "scp",
-  "rsync",
-  "tar",
-  "zip",
-  "unzip",
-  "gzip",
-  "gunzip",
+  // 下载
+  "wget ",
+  "curl -o ",
+  "curl -O ",
+  "scp ",
+  "rsync ",
+  // 压缩
+  "tar ",
+  "zip ",
+  "unzip ",
+  "gzip ",
+  "gunzip ",
+  // 原地编辑
   "sed -i",
   "perl -i",
-  "patch",
-  "node",
-  "python",
-  "python3",
+  "patch ",
+  // 脚本执行（可能有副作用）
+  "node ",
+  "python ",
+  "python3 ",
+  "ruby ",
+  "perl ",
+  "php ",
+  "bash ",
+  "sh ",
+  "zsh ",
+  // Windows 写操作
+  "del ",
+  "erase ",
+  "move ",
+  "copy ",
+  "mkdir ",
+  "md ",
+  "rmdir ",
+  "rd ",
+  "ren ",
+  "rename ",
+  "attrib ",
+  "New-Item",
+  "Remove-Item",
+  "Move-Item",
+  "Copy-Item",
+  "Set-Content",
+  "Add-Content",
+  "Clear-Content",
+  "Rename-Item",
+  "Set-ItemProperty",
+  "Install-Module",
+  "Uninstall-Module",
+  "git.exe ",
 ];
 
-/**
- * Compile prefix lists into regex patterns for strict word-boundary matching.
- * E.g., "cat" becomes /^cat(?:\s|$)/, matching "cat file" but not "catch".
- */
-const compilePrefixes = (prefixes: string[]): RegExp[] =>
-  prefixes.map((p) => {
-    const escaped = p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`^${escaped}(?:\\s|$)`);
-  });
-
-const READ_ONLY_PATTERNS = compilePrefixes(READ_ONLY_COMMANDS);
-const WRITE_PATTERNS = compilePrefixes(WRITE_COMMANDS);
-
-/** Regex to match quoted strings (handles escaped quotes inside) */
-const QUOTE_REGEX = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g;
+// ── 引号感知的命令拆分 ────────────────────────────────────
 
 /**
- * Splits a command string by pipes/chains while respecting quoted strings.
- * "cat a.txt | grep 'A && B'" → ["cat a.txt", "grep 'A && B'"]
+ * 将命令按管道/链式操作符拆分，但忽略引号内的操作符
+ *
+ * 'cat "a|b.txt" | grep foo && echo "x;y"'
+ * → ['cat "a|b.txt"', 'grep foo', 'echo "x;y"']
  */
 export function splitCommandSegments(command: string): string[] {
-  // Temporarily replace operators inside quotes to prevent false splitting
-  const sanitized = command.replace(QUOTE_REGEX, (match) =>
-    match.replace(/[|;&]/g, " "),
-  );
+  const segments: string[] = [];
+  let current = "";
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
 
-  return sanitized
-    .split(/\s*(?:\|\||&&|[|;])\s*/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      current += ch;
+      continue;
+    }
+
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      current += ch;
+      continue;
+    }
+
+    // 不在引号内时，检测操作符
+    if (!inSingle && !inDouble) {
+      // ||
+      if (ch === "|" && command[i + 1] === "|") {
+        segments.push(current.trim());
+        current = "";
+        i++; // 跳过第二个 |
+        continue;
+      }
+      // |（管道）
+      if (ch === "|") {
+        segments.push(current.trim());
+        current = "";
+        continue;
+      }
+      // &&
+      if (ch === "&" && command[i + 1] === "&") {
+        segments.push(current.trim());
+        current = "";
+        i++;
+        continue;
+      }
+      // ;
+      if (ch === ";") {
+        segments.push(current.trim());
+        current = "";
+        continue;
+      }
+    }
+
+    current += ch;
+  }
+
+  if (current.trim()) {
+    segments.push(current.trim());
+  }
+
+  return segments.filter((s) => s.length > 0);
 }
 
+// ── 嵌套命令检测 ──────────────────────────────────────────
+
 /**
- * Detects output redirection (write operation), ignoring redirects in quotes.
- * "echo hi > file.txt" → true
- * "echo 'a > b'" → false
+ * 提取嵌套命令（命令替换、子 shell、-c 参数等）
+ *
+ * "echo $(rm -rf /)"       → ["rm -rf /"]
+ * "bash -c 'rm -rf /'"     → ["rm -rf /"]
+ * "find . -exec rm {} \;"  → ["rm {}"]
+ * "xargs rm"               → ["rm"]（xargs 后的命令）
+ */
+export function extractNestedCommands(command: string): string[] {
+  const nested: string[] = [];
+
+  // $() 命令替换
+  const cmdSubstRegex = /\$\(([^)]+)\)/g;
+  let match;
+  while ((match = cmdSubstRegex.exec(command)) !== null) {
+    nested.push(match[1]);
+  }
+
+  // 反引号命令替换
+  const backtickRegex = /`([^`]+)`/g;
+  while ((match = backtickRegex.exec(command)) !== null) {
+    nested.push(match[1]);
+  }
+
+  // bash -c / sh -c / zsh -c
+  const shellCRegex =
+    /(?:bash|sh|zsh|cmd|powershell|pwsh)\s+(?:-\w+\s+)*-c\s+["']?([^"']+)["']?/gi;
+  while ((match = shellCRegex.exec(command)) !== null) {
+    nested.push(match[1]);
+  }
+
+  // find -exec
+  const findExecRegex = /-exec\s+(.+?)(?:\s*\\;|\s*;|\s*\\+\s*)/g;
+  while ((match = findExecRegex.exec(command)) !== null) {
+    nested.push(match[1]);
+  }
+
+  // xargs <cmd>
+  const xargsRegex = /xargs\s+(?:-\w+\s+)*(\S+)/g;
+  while ((match = xargsRegex.exec(command)) !== null) {
+    nested.push(match[1]);
+  }
+
+  return nested;
+}
+
+// ── 环境变量前缀剥离 ──────────────────────────────────────
+
+/**
+ * 剥离环境变量赋值前缀
+ * "FOO=bar BAZ=qux rm file" → "rm file"
+ */
+export function stripEnvPrefix(segment: string): string {
+  return segment.replace(/^(\s*\w+=\S+\s+)+/, "").trim();
+}
+
+// ── 重定向检测 ────────────────────────────────────────────
+
+/**
+ * 检测输出重定向（写操作）
+ * 排除 2>&1（stderr 重定向到 stdout，非文件写入）
  */
 export function hasRedirect(command: string): boolean {
-  const noQuotes = command.replace(QUOTE_REGEX, "");
-  // Matches > or >> but excludes 2>&1
-  return /(?<!\d)>{1,2}(?!&)/.test(noQuotes);
+  // 移除引号内容，避免误判 echo ">" 这种
+  const stripped = command.replace(/"[^"]*"/g, "").replace(/'[^']*'/g, "");
+  return /(?<!\d)>{1,2}(?!&)/.test(stripped);
 }
 
-/**
- * Strips leading environment variable assignments.
- * "NODE_ENV=prod npm run build" → "npm run build"
- */
-function stripEnvVars(cmd: string): string {
-  return cmd.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, "");
-}
+// ── 单段分类 ──────────────────────────────────────────────
 
-/**
- * Classifies a single command segment.
- */
 function classifySegment(segment: string): BashCommandClass {
-  const stripped = stripEnvVars(segment.trim());
+  // 剥离环境变量前缀
+  const trimmed = stripEnvPrefix(segment.trim());
 
-  // 1. Dangerous prefix checks (highest priority)
-  if (DANGEROUS_COMMAND_PREFIXES.some((p) => stripped.startsWith(p))) {
-    return "dangerous";
+  if (!trimmed) return "read"; // 纯环境变量赋值，无命令
+
+  // 1. 危险命令
+  for (const pattern of DANGEROUS_COMMANDS) {
+    if (trimmed.startsWith(pattern) || trimmed === pattern.trim()) {
+      return "dangerous";
+    }
   }
 
-  // 2. Redirect checks (treat as write)
-  if (hasRedirect(stripped)) {
+  // 2. 重定向
+  if (hasRedirect(trimmed)) {
     return "write";
   }
 
-  // 3. Read-only checks
-  if (READ_ONLY_PATTERNS.some((re) => re.test(stripped))) {
-    return "read";
+  // 3. 只读命令
+  for (const pattern of READ_ONLY_COMMANDS) {
+    if (trimmed.startsWith(pattern) || trimmed === pattern.trim()) {
+      return "read";
+    }
   }
 
-  // 4. Write checks
-  if (WRITE_PATTERNS.some((re) => re.test(stripped))) {
-    return "write";
+  // 4. 写操作命令
+  for (const pattern of WRITE_COMMANDS) {
+    if (trimmed.startsWith(pattern)) {
+      return "write";
+    }
   }
 
-  // 5. Cannot classify
+  // 5. 无法判断
   return "unknown";
 }
 
+// ── 主分类函数 ────────────────────────────────────────────
+
 /**
- * Classifies a full bash command string.
+ * 分类整条 bash 命令（v2 加固版）
  *
- * Rules:
- * - Any segment is dangerous → dangerous (checked globally and per-segment)
- * - Any segment is write or unknown → write (safety-first)
- * - All segments are read → read
+ * 流程：
+ * 1. 提取嵌套命令，递归分类
+ * 2. 按管道/链式拆分（引号感知）
+ * 3. 逐段分类
+ * 4. 取最严格结果：dangerous > write/unknown > read
  */
 export function classifyBashCommand(command: string): BashCommandClass {
-  const trimmedCmd = command.trim();
-  if (trimmedCmd.length === 0) return "unknown";
-
-  // Global dangerous regex check (e.g., pipe bombs that span segments)
-  if (DANGEROUS_COMMAND_REGEXES.some((re) => re.test(trimmedCmd))) {
-    return "dangerous";
+  if (!command || !command.trim()) {
+    return "unknown";
   }
-
-  const segments = splitCommandSegments(trimmedCmd);
-  if (segments.length === 0) return "unknown";
 
   let result: BashCommandClass = "read";
 
+  // 1. 检查嵌套命令
+  const nested = extractNestedCommands(command);
+  for (const nestedCmd of nested) {
+    const cls = classifyBashCommand(nestedCmd); // 递归
+    if (cls === "dangerous") return "dangerous";
+    if (cls === "write" || cls === "unknown") result = "write";
+  }
+
+  // 2. 拆分命令段
+  const segments = splitCommandSegments(command);
+
+  if (segments.length === 0) {
+    return result === "read" ? "unknown" : result;
+  }
+
+  // 3. 逐段分类
   for (const segment of segments) {
     const cls = classifySegment(segment);
 
     if (cls === "dangerous") {
-      return "dangerous"; // Immediate return, highest priority
+      return "dangerous";
     }
     if (cls === "write" || cls === "unknown") {
-      result = "write"; // Upgrade severity, but continue checking other segments
+      result = "write";
     }
   }
 

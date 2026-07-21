@@ -233,4 +233,58 @@ rules:
         - "terraform apply*"
         - "terraform destroy*"
     action: ask
-    reason: "Infrastructure/deployment change requires confirmation"
+    reason:
+      "Infrastructure/deployment change requires confirmation"
+
+      # ── Windows 命令 ──────────────────────────────
+
+  # Windows 只读命令：放行
+  - tool: bash
+    match:
+      command:
+        - "dir *"
+        - "type *"
+        - "Get-Content *"
+        - "Get-ChildItem *"
+        - "Get-Item *"
+        - "Get-Location"
+        - "Get-Command *"
+        - "Write-Output *"
+        - "Select-String *"
+        - "Get-GitStatus"
+    action: allow
+
+  # Windows 危险命令：强制拒绝
+  - tool: bash
+    match:
+      command:
+        - "format *"
+        - "del /s /q *"
+        - "rd /s /q *"
+        - "Remove-Item -Recurse -Force C:*"
+        - "diskpart*"
+        - "reg delete *"
+        - "Stop-Computer*"
+        - "Restart-Computer*"
+    action: deny
+    reason: "Windows 高危命令，已被权限系统拦截"
+
+  # Windows 写操作：需要确认
+  - tool: bash
+    match:
+      command:
+        - "del *"
+        - "erase *"
+        - "move *"
+        - "copy *"
+        - "mkdir *"
+        - "ren *"
+        - "New-Item *"
+        - "Remove-Item *"
+        - "Move-Item *"
+        - "Copy-Item *"
+        - "Set-Content *"
+        - "Add-Content *"
+        - "Install-Module *"
+    action: ask
+    reason: "Windows 写操作需要确认"
