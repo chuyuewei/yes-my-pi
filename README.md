@@ -6,8 +6,6 @@ Pi 是引擎，yes-my-pi 是产品层。
 yes-my-pi 不修改 Pi 一行源码，全部通过 Pi 的扩展系统实现权限管控与审批流程。
 
 [![Quality gate](https://sonarcloud.io/api/project_badges/quality_gate?project=chuyuewei_yes-my-pi)](https://sonarcloud.io/summary/new_code?id=chuyuewei_yes-my-pi)
-[![npm](https://img.shields.io/npm/v/yes-my-pi)](https://www.npmjs.com/package/yes-my-pi)
-[![node](https://img.shields.io/node/v/yes-my-pi)](https://nodejs.org)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 ```bash
