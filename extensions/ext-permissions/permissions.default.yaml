@@ -1,0 +1,236 @@
+# ─────────────────────────────────────────────────────────────
+# yes-my-pi — Default Permission Rules (factory baseline)
+# ─────────────────────────────────────────────────────────────
+#
+# Evaluation model (see rule-engine.ts for the authoritative logic):
+#   - Severity across ALL scopes: deny > ask > allow
+#     A `deny` rule in ANY scope (project/global/default) is an absolute
+#     floor — no scope can override it.
+#   - Within a single scope's `rules` array: FIRST MATCH WINS.
+#     Rule order matters — more specific rules MUST come before more
+#     general ones that could also match the same command.
+#   - Pattern syntax: NO wildcard = exact match only. Use `*` (matches
+#     anything except nothing special — no path-awareness in bash
+#     commands), or `**` for multi-segment glob on file paths.
+#
+# This file is the factory default. Override it via:
+#   - Project scope: <project>/.yes-my-pi/permissions.yaml
+#   - Global scope:  ~/.yes-my-pi/permissions.yaml
+#
+# ⚠️ Ordering warning: when adding new `allow` rules for a tool/command
+# family, double-check no destructive sub-command of that same family
+# (e.g. `git branch -D`, `git tag -d`) would also match your pattern.
+# ─────────────────────────────────────────────────────────────
+
+version: 1
+defaultAction: ask # No rule matched → require user confirmation
+
+rules:
+  # ── Read-only tools: always allowed ──────────────────────
+  - tool: read
+    action: allow
+  - tool: grep
+    action: allow
+  - tool: find
+    action: allow
+  - tool: ls
+    action: allow
+
+  # ── Write tools: require confirmation ────────────────────
+  - tool: write
+    action: ask
+    reason: "Creating/overwriting a file requires confirmation"
+  - tool: edit
+    action: ask
+    reason: "Editing a file requires confirmation"
+
+  # ── bash: matched by command pattern ─────────────────────
+  #
+  # IMPORTANT: destructive sub-commands of an otherwise-safe command
+  # family MUST be listed BEFORE that family's blanket `allow` rule,
+  # since evaluation is first-match-wins within this array.
+
+  # Destructive git sub-commands that would otherwise be swallowed by
+  # a broader "safe git command" allow-rule below. Listed first on
+  # purpose.
+  - tool: bash
+    match:
+      command:
+        - "git branch -d*"
+        - "git branch -D*"
+        - "git tag -d*"
+        - "git clean -f*"
+        - "git clean -d*"
+        - "git clean -x*"
+        - "git clean -fd*"
+        - "git clean -fdx*"
+        - "git push --force*"
+        - "git push -f*"
+        - "git push --force-with-lease*"
+    action: ask
+    reason: "Destructive/irreversible git operation — please confirm"
+
+  # Read-only / inspection commands: allowed
+  - tool: bash
+    match:
+      command:
+        - "npm test*"
+        - "npm run test*"
+        - "npm run lint*"
+        - "npm run build*"
+        - "npm run check*"
+        - "npm run typecheck*"
+        - "npx vitest*"
+        - "npx jest*"
+        - "npx tsc*"
+        - "npx eslint*"
+        - "npx prettier*"
+        - "pytest*"
+        - "cargo test*"
+        - "cargo build*"
+        - "cargo clippy*"
+        - "cargo check*"
+        - "go test*"
+        - "go build*"
+        - "go vet*"
+        # `make` can run arbitrary Makefile targets (deploy, clean, publish...).
+        # Only allow a conservative set of conventional, non-destructive
+        # target names by default. Project-level config can widen this
+        # if the repo's Makefile is trusted.
+        - "make test*"
+        - "make build*"
+        - "make lint*"
+        - "make check*"
+        - "make fmt*"
+        - "git status*"
+        - "git log*"
+        - "git diff*"
+        - "git show*"
+        - "git branch"
+        - "git branch -a*"
+        - "git branch -r*"
+        - "git branch -v*"
+        - "git branch --list*"
+        - "git branch --show-current*"
+        - "git stash list*"
+        - "git tag"
+        - "git tag -l*"
+    action: allow
+
+  # High-risk commands: hard-denied in ALL modes.
+  # Mirrors bash-analyzer.ts's DANGEROUS_COMMAND_PREFIXES for
+  # defense-in-depth (explicit rules give a clearer `reason` to the
+  # user than the generic classifier fallback).
+  - tool: bash
+    match:
+      command:
+        - "rm -rf /"
+        - "rm -rf /*"
+        - "rm -rf ~"
+        - "rm -rf ~/"
+        - "sudo *"
+        - "su *"
+        # curl/wget piped into a shell — with and without surrounding spaces
+        - "curl * | bash*"
+        - "curl * | sh*"
+        - "curl *|bash*"
+        - "curl *|sh*"
+        - "wget * | bash*"
+        - "wget * | sh*"
+        - "wget *|bash*"
+        - "wget *|sh*"
+        - "chmod 777*"
+        - "chmod -R 777*"
+        - "chown -R*"
+        - "dd if=*"
+        - "mkfs*"
+        - ":(){ :|:& };:*"
+        - "> /dev/sda*"
+        - "> /dev/nvme*"
+        - "shutdown*"
+        - "reboot*"
+        - "halt*"
+        - "poweroff*"
+        - "kill -9 1"
+        - "killall *"
+        - "iptables *"
+        - "ufw *"
+        - "systemctl stop*"
+        - "systemctl disable*"
+        - "service * stop*"
+    action: deny
+    reason: "High-risk command — blocked by the permission system"
+
+  # Git write operations (excluding the destructive ones already
+  # handled above): require confirmation
+  - tool: bash
+    match:
+      command:
+        - "git commit*"
+        - "git push*"
+        - "git checkout*"
+        - "git switch*"
+        - "git merge*"
+        - "git rebase*"
+        - "git reset*"
+        - "git cherry-pick*"
+        - "git stash pop*"
+        - "git stash drop*"
+        - "git remote add*"
+        - "git remote remove*"
+    action: ask
+    reason: "Git write operation requires confirmation"
+
+  # Language/package-manager dependency changes: require confirmation
+  - tool: bash
+    match:
+      command:
+        - "npm install*"
+        - "npm i *"
+        - "npm ci*"
+        - "npm uninstall*"
+        - "npm remove*"
+        - "yarn add*"
+        - "yarn remove*"
+        - "yarn install*"
+        - "pnpm add*"
+        - "pnpm remove*"
+        - "pnpm install*"
+        - "pip install*"
+        - "pip3 install*"
+        - "pip uninstall*"
+        - "cargo install*"
+        - "go install*"
+        - "go get*"
+    action: ask
+    reason: "Installing/removing a dependency requires confirmation"
+
+  # System-level package managers: require confirmation (broader
+  # blast radius than a project-local dependency install)
+  - tool: bash
+    match:
+      command:
+        - "apt *"
+        - "apt-get *"
+        - "yum *"
+        - "brew install*"
+        - "brew uninstall*"
+        - "brew upgrade*"
+    action: ask
+    reason: "System-level package management requires confirmation"
+
+  # Infrastructure / deployment changes: require confirmation
+  - tool: bash
+    match:
+      command:
+        - "docker build*"
+        - "docker run*"
+        - "docker push*"
+        - "docker compose up*"
+        - "docker-compose up*"
+        - "kubectl apply*"
+        - "kubectl delete*"
+        - "terraform apply*"
+        - "terraform destroy*"
+    action: ask
+    reason: "Infrastructure/deployment change requires confirmation"

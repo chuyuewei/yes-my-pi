@@ -1,0 +1,30 @@
+{
+  "name": "yes-my-pi",
+  "version": "0.1.0",
+  "description": "Controllable AI Programmable Agents Built on Pi",
+  "type": "module",
+  "bin": {
+    "ymp": "./bin/ymp.js",
+    "yes-my-pi": "./bin/ymp.js"
+  },
+  "scripts": {
+    "start": "node bin/ymp.js",
+    "dev": "node --watch bin/ymp.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.80.10",
+    "@earendil-works/pi-agent-core": "^0.80.10",
+    "@earendil-works/pi-coding-agent": "^0.80.10",
+    "@earendil-works/pi-tui": "^0.80.10"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "terminal",
+    "pi"
+  ],
+  "license": "MIT"
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "yes-my-pi settings (read by ext-permissions)",
+  "version": 1,
+
+  "approval": {
+    "defaultMode": "auto-edit",
+    "modes": {
+      "suggest": "所有工具调用需用户确认",
+      "auto-edit": "只读工具自动放行，写操作需确认",
+      "full-auto": "全部自动放行（仍受 deny 规则约束）"
+    }
+  },
+
+  "permissions": {
+    "rulesFile": "permissions.default.yaml",
+    "sessionOverrides": true
+  },
+
+  "identity": {
+    "name": "yes-my-pi",
+    "alias": "ymp",
+    "systemPromptFile": "SYSTEM.md",
+    "agentsTemplateFile": "AGENTS.md"
+  }
+}

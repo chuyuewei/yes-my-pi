@@ -1,0 +1,139 @@
+# ─────────────────────────────────────────────────────────────
+# yes-my-pi — Example Permission Rules
+# ─────────────────────────────────────────────────────────────
+#
+# Copy this file to:
+#   - Project scope: <project-root>/.pi/permissions.yaml
+#   - Global scope:  ~/.pi/permissions.yaml
+#
+# ── How rules are evaluated (read this before editing) ──────
+#
+# 1. Scope precedence: project > global > default
+#    Project and global rules can OVERRIDE the built-in default's
+#    `ask`/`allow` decisions for the same command.
+#
+# 2. Deny is an absolute floor across ALL scopes.
+#    If ANY scope — including the factory default — has a `deny` rule
+#    matching a call, the call is denied. A project/global `allow` rule
+#    CANNOT override a `deny` set elsewhere. This is intentional: it
+#    means a project can only make things stricter or relax an `ask`
+#    into an `allow` — it can never re-enable something that was
+#    hard-denied by a broader scope.
+#    → If you need to run a command that's denied by default, you
+#      cannot "allow" your way past it here — that command is
+#      considered unsafe in all circumstances by design.
+#
+# 3. Within a single file's `rules:` list, evaluation is
+#    FIRST MATCH WINS (not "most specific wins"). Put more specific
+#    rules BEFORE more general ones that could also match.
+#
+# 4. Pattern matching:
+#      "npm test"      exact match only (no wildcard = exact)
+#      "npm test*"     prefix wildcard — matches "npm test -- --watch"
+#      "src/**/*.ts"   glob — matches any .ts file under src/, any depth
+#      "*.env"         matches any single path segment ending in .env
+#      "*"             matches anything
+#    A pattern can be a single string or a list of strings (OR logic).
+#
+# ─────────────────────────────────────────────────────────────
+
+version: 1
+defaultAction: ask
+
+rules:
+  # ── Example: scope the agent to a subdirectory (monorepo) ──
+  # Useful when the agent should only work within one package/app
+  # in a larger monorepo, even though it's invoked from the repo root.
+  #
+  # - tool: read
+  #   match:
+  #     path: "packages/my-app/**"
+  #   action: allow
+  # - tool: write
+  #   match:
+  #     path: "packages/my-app/**"
+  #   action: ask
+  # - tool: edit
+  #   match:
+  #     path: "packages/my-app/**"
+  #   action: ask
+  # # Anything outside the target package falls through to defaultAction
+  # # (or an explicit trailing deny, if you want a hard boundary):
+  # - tool: write
+  #   match:
+  #     path: "**"
+  #   action: deny
+  #   reason: "This agent is scoped to packages/my-app only"
+
+  # ── Example: protect sensitive files ────────────────────────
+  # Note: patterns must account for the fact that unmatched patterns
+  # are EXACT matches only. Use "**" to cover subdirectories, and
+  # list common variants (e.g. `.env.production.local`) explicitly —
+  # don't assume a single pattern catches every case.
+  - tool: write
+    match:
+      path:
+        - "**/.env.production"
+        - "**/.env.production.*"
+        - "**/.env*.local"
+        - "**/secrets/**"
+        - "**/*.pem"
+        - "**/id_rsa*"
+    action: deny
+    reason: "Production config / credentials must not be modified by AI"
+
+  - tool: edit
+    match:
+      path:
+        - "**/.env.production"
+        - "**/.env.production.*"
+        - "**/.env*.local"
+        - "**/secrets/**"
+        - "**/*.pem"
+        - "**/id_rsa*"
+    action: deny
+    reason: "Production config / credentials must not be modified by AI"
+
+  # ── Example: allow reading a specific directory freely ──────
+  # - tool: read
+  #   match:
+  #     path: "docs/**"
+  #   action: allow
+
+  # ── Example: relax a default "ask" into "allow" ─────────────
+  # The factory default marks infra commands like `docker compose up`
+  # as `ask`. If your team trusts this command in local dev, you can
+  # narrow the pattern to your own compose file and allow it here.
+  # (This works because we're relaxing `ask` → `allow`, not overriding
+  # a `deny` — see rule #2 above.)
+  - tool: bash
+    match:
+      command: "docker compose -f docker-compose.dev.yml up*"
+    action: allow
+
+  # ── Example: allow a project-specific safe script ───────────
+  # - tool: bash
+  #   match:
+  #     command:
+  #       - "npm run dev*"
+  #       - "npm run storybook*"
+  #   action: allow
+
+  # ── Example: tighten default network access rules ───────────
+  # The factory default doesn't hard-deny curl/wget (some workflows
+  # need them). Uncomment to forbid outbound network calls entirely
+  # in this project.
+  # - tool: bash
+  #   match:
+  #     command:
+  #       - "curl*"
+  #       - "wget*"
+  #   action: deny
+  #   reason: "Outbound network requests are not allowed in this project"
+
+  # ── Example: require confirmation for a specific risky script ──
+  # - tool: bash
+  #   match:
+  #     command: "./scripts/deploy.sh*"
+  #   action: ask
+  #   reason: "This script deploys to a shared environment"
