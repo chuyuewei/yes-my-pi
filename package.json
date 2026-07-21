@@ -1,7 +1,7 @@
 {
   "name": "yes-my-pi",
   "version": "0.1.0",
-  "description": "Controllable AI Programmable Agents Built on Pi",
+  "description": "Controllable AI coding agent built on the Pi engine",
   "type": "module",
   "bin": {
     "ymp": "./bin/ymp.js",
@@ -24,7 +24,10 @@
     "ai",
     "coding-agent",
     "terminal",
-    "pi"
+    "pi",
+    "permission-system",
+    "approval-modes"
   ],
   "license": "MIT"
 }
+

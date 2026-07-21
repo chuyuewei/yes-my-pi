@@ -2,18 +2,19 @@
 import process from "node:process";
 
 /**
- * yes-my-pi (ymp) CLI 入口
+ * yes-my-pi (ymp) CLI entry.
  *
- * Paper 模式：Pi 是上游引擎，yes-my-pi 是产品层。
- * 本文件职责：
- *   1. 透传用户传入的 CLI 参数
- *   2. 若用户未显式指定 system prompt，注入 ymp 默认身份
- *   3. 启动上游 Pi 引擎，并处理启动期错误
+ * Paper model: Pi is the upstream engine, yes-my-pi is the product layer.
+ * Responsibilities of this file:
+ *   1. Forward all CLI args as-is to Pi.
+ *   2. Inject the ymp default identity into the system prompt when the
+ *      user hasn't supplied their own (or an --append-system-prompt).
+ *   3. Boot the upstream Pi engine and report startup errors.
  */
 
 const YMP_SYSTEM_PROMPT = [
   "You are yes-my-pi (ymp), a controllable AI coding agent built on Pi.",
-  "You respect the permission system: some tool calls may require user approval.",
+  "You respect the permission system: some tool calls require user approval.",
   "When a tool call is blocked, acknowledge the denial and adjust your approach.",
 ].join(" ");
 
@@ -23,16 +24,14 @@ const SYSTEM_PROMPT_FLAGS = new Set([
 ]);
 
 /**
- * 若用户未显式传入 system prompt 相关参数，则追加 ymp 默认身份。
- * @param {string[]} userArgs
- * @returns {string[]}
+ * Append the ymp default identity to the system prompt unless the user
+ * has already supplied either flag. Otherwise return args unchanged.
  */
 export function buildArgs(userArgs) {
-  const hasSystemPrompt = userArgs.some((arg) => SYSTEM_PROMPT_FLAGS.has(arg));
-
-  if (hasSystemPrompt) {
-    return userArgs;
-  }
+  const hasSystemPrompt = userArgs.some((arg) =>
+    SYSTEM_PROMPT_FLAGS.has(arg),
+  );
+  if (hasSystemPrompt) return userArgs;
 
   return [...userArgs, "--append-system-prompt", YMP_SYSTEM_PROMPT];
 }
@@ -46,7 +45,8 @@ async function run() {
   } catch (err) {
     throw new Error(
       `Failed to load "@earendil-works/pi-coding-agent". ` +
-        `Please check the installation.\n${err instanceof Error ? err.message : err}`,
+        `Please check the installation.\n` +
+        `${err instanceof Error ? err.message : err}`,
     );
   }
 
@@ -55,8 +55,6 @@ async function run() {
 
 run().catch((err) => {
   console.error(`[ymp] ${err instanceof Error ? err.message : String(err)}`);
-  if (process.env.YMP_DEBUG) {
-    console.error(err);
-  }
+  if (process.env.YMP_DEBUG) console.error(err);
   process.exitCode = 1;
 });

@@ -2,7 +2,7 @@
 # yes-my-pi — Default Permission Rules (factory baseline)
 # ─────────────────────────────────────────────────────────────
 #
-# Evaluation model (see rule-engine.ts for the authoritative logic):
+# Evaluation model (see matcher.ts for the authoritative logic):
 #   - Severity across ALL scopes: deny > ask > allow
 #     A `deny` rule in ANY scope (project/global/default) is an absolute
 #     floor — no scope can override it.
@@ -10,12 +10,12 @@
 #     Rule order matters — more specific rules MUST come before more
 #     general ones that could also match the same command.
 #   - Pattern syntax: NO wildcard = exact match only. Use `*` (matches
-#     anything except nothing special — no path-awareness in bash
-#     commands), or `**` for multi-segment glob on file paths.
+#     anything except `/` — no path-awareness in bash commands), or
+#     `**` for multi-segment glob on file paths.
 #
 # This file is the factory default. Override it via:
-#   - Project scope: <project>/.yes-my-pi/permissions.yaml
-#   - Global scope:  ~/.yes-my-pi/permissions.yaml
+#   - Project scope: <project>/.pi/permissions.yaml
+#   - Global scope:  ~/.pi/permissions.yaml
 #
 # ⚠️ Ordering warning: when adding new `allow` rules for a tool/command
 # family, double-check no destructive sub-command of that same family
@@ -23,7 +23,7 @@
 # ─────────────────────────────────────────────────────────────
 
 version: 1
-defaultAction: ask # No rule matched → require user confirmation
+defaultAction: ask  # No rule matched → require user confirmation
 
 rules:
   # ── Read-only tools: always allowed ──────────────────────
@@ -39,7 +39,7 @@ rules:
   # ── Write tools: require confirmation ────────────────────
   - tool: write
     action: ask
-    reason: "Creating/overwriting a file requires confirmation"
+    reason: "Creating or overwriting a file requires confirmation"
   - tool: edit
     action: ask
     reason: "Editing a file requires confirmation"
@@ -68,7 +68,7 @@ rules:
         - "git push -f*"
         - "git push --force-with-lease*"
     action: ask
-    reason: "Destructive/irreversible git operation — please confirm"
+    reason: "Destructive or irreversible git operation — please confirm"
 
   # Read-only / inspection commands: allowed
   - tool: bash
@@ -93,10 +93,10 @@ rules:
         - "go test*"
         - "go build*"
         - "go vet*"
-        # `make` can run arbitrary Makefile targets (deploy, clean, publish...).
-        # Only allow a conservative set of conventional, non-destructive
-        # target names by default. Project-level config can widen this
-        # if the repo's Makefile is trusted.
+        # `make` can run arbitrary Makefile targets (deploy, clean,
+        # publish…). Only allow a conservative set of conventional,
+        # non-destructive target names by default. Project-level config
+        # can widen this if the repo's Makefile is trusted.
         - "make test*"
         - "make build*"
         - "make lint*"
@@ -118,9 +118,9 @@ rules:
     action: allow
 
   # High-risk commands: hard-denied in ALL modes.
-  # Mirrors bash-analyzer.ts's DANGEROUS_COMMAND_PREFIXES for
-  # defense-in-depth (explicit rules give a clearer `reason` to the
-  # user than the generic classifier fallback).
+  # Mirrors bash-analyzer.ts's DANGEROUS_COMMANDS for defense-in-depth
+  # (explicit rules give a clearer `reason` than the generic
+  # classifier fallback).
   - tool: bash
     match:
       command:
@@ -130,7 +130,7 @@ rules:
         - "rm -rf ~/"
         - "sudo *"
         - "su *"
-        # curl/wget piped into a shell — with and without surrounding spaces
+        # curl/wget piped into a shell — with and without spaces
         - "curl * | bash*"
         - "curl * | sh*"
         - "curl *|bash*"
@@ -203,10 +203,10 @@ rules:
         - "go install*"
         - "go get*"
     action: ask
-    reason: "Installing/removing a dependency requires confirmation"
+    reason: "Installing or removing a dependency requires confirmation"
 
-  # System-level package managers: require confirmation (broader
-  # blast radius than a project-local dependency install)
+  # System-level package managers: require confirmation (broader blast
+  # radius than a project-local dependency install)
   - tool: bash
     match:
       command:
@@ -233,12 +233,11 @@ rules:
         - "terraform apply*"
         - "terraform destroy*"
     action: ask
-    reason:
-      "Infrastructure/deployment change requires confirmation"
+    reason: "Infrastructure or deployment change requires confirmation"
 
-      # ── Windows 命令 ──────────────────────────────
+  # ── Windows commands ─────────────────────────────────────
 
-  # Windows 只读命令：放行
+  # Windows read-only: allowed
   - tool: bash
     match:
       command:
@@ -254,7 +253,7 @@ rules:
         - "Get-GitStatus"
     action: allow
 
-  # Windows 危险命令：强制拒绝
+  # Windows high-risk: hard-denied
   - tool: bash
     match:
       command:
@@ -267,9 +266,9 @@ rules:
         - "Stop-Computer*"
         - "Restart-Computer*"
     action: deny
-    reason: "Windows 高危命令，已被权限系统拦截"
+    reason: "Windows high-risk command — blocked by the permission system"
 
-  # Windows 写操作：需要确认
+  # Windows write operations: require confirmation
   - tool: bash
     match:
       command:
@@ -287,4 +286,4 @@ rules:
         - "Add-Content *"
         - "Install-Module *"
     action: ask
-    reason: "Windows 写操作需要确认"
+    reason: "Windows write operation requires confirmation"

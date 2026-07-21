@@ -1,7 +1,7 @@
 {
   "name": "yes-my-pi-permissions",
-  "version": "0.1.0",
-  "description": "Permission & approval system for yes-my-pi",
+  "version": "0.2.0",
+  "description": "Permission and approval-mode system for yes-my-pi",
   "type": "module",
   "main": "index.ts",
   "peerDependencies": {

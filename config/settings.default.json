@@ -5,9 +5,9 @@
   "approval": {
     "defaultMode": "auto-edit",
     "modes": {
-      "suggest": "所有工具调用需用户确认",
-      "auto-edit": "只读工具自动放行，写操作需确认",
-      "full-auto": "全部自动放行（仍受 deny 规则约束）"
+      "suggest": "Every tool call requires user confirmation",
+      "auto-edit": "Read-only tools auto-approved, writes require confirmation",
+      "full-auto": "Everything auto-approved (deny rules still apply)"
     }
   },
 

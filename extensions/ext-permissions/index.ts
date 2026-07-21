@@ -1,22 +1,32 @@
 /**
- * yes-my-pi 权限系统 - Pi 扩展入口
+ * yes-my-pi Permission System — Pi Extension Entry
  *
- * 将规则引擎（T3）+ 审批模式（T4）+ 边界处理（T5）
- * 接入 Pi 的 tool_call 事件。
+ * Wires the rule engine (T3), approval mode (T4), and edge cases (T5)
+ * into Pi's extension event surface.
  *
- * 挂载点：
- *   - tool_call   ：拦截工具调用，执行权限求值
- *   - /mode       ：切换审批模式
- *   - /permissions：查看规则与状态
- *   - 状态栏      ：显示当前模式
+ * Hook points:
+ *   - tool_call          intercept every tool invocation
+ *   - /mode              cycle or set the approval mode
+ *   - /permissions       inspect rules and session overrides
+ *   - footer status      reflect the current mode
  *
- * 铁律：deny 在任何模式下都不可覆盖。
+ * Iron rule: `deny` is absolute — no mode, scope, or user override can
+ * regenerate it into anything else.
  */
 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  ExtensionUIDialogOptions,
+  SessionShutdownEvent,
+  SessionStartEvent,
+  ToolCallEvent,
+  ToolCallEventResult,
+} from "@earendil-works/pi-coding-agent";
 
 import { evaluateToolCall } from "./src/matcher.js";
 import { loadAllConfigs, watchConfigs, type ConfigSet } from "./src/loader.js";
@@ -26,42 +36,38 @@ import {
   MODE_DESCRIPTIONS,
   MODE_ICONS,
   ALL_MODES,
+  getNextMode,
   type ApprovalMode,
 } from "./src/mode.js";
 import { getToolInfo } from "./src/tool-registry.js";
-import type { ToolCallInfo, MatchResult } from "./src/types.js";
+import type { MatchResult, ToolCallInfo } from "./src/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// ── 常量 ──────────────────────────────────────────────────
-
 const MAX_ARGS_DISPLAY = 200;
+const STATUS_KEY = "ymp-mode";
+const ASK_TIMEOUT_MS = 60_000;
 
-// ── 配置路径 ──────────────────────────────────────────────
+const DIR = { READ: "read", WRITE: "write", MIXED: "mixed", UNKNOWN: "unknown" };
 
 function getConfigPaths() {
   return {
-    /** 出厂默认规则（随扩展包分发） */
+    /** Factory-shipped defaults (lives next to the extension). */
     default: join(__dirname, "permissions.default.yaml"),
-    /** 全局用户规则 */
+    /** Global user rules: ~/.pi/agent/permissions.yaml */
     global: join(homedir(), ".pi", "agent", "permissions.yaml"),
-    /** 项目级规则 */
+    /** Project-level rules: <cwd>/.pi/permissions.yaml */
     project: join(process.cwd(), ".pi", "permissions.yaml"),
   };
 }
 
-// ── 会话级临时覆盖 ────────────────────────────────────────
-
 interface SessionOverrides {
-  /** 本会话内始终允许的工具 */
   alwaysAllow: Set<string>;
-  /** 本会话内始终拒绝的工具 */
   alwaysDeny: Set<string>;
 }
 
-// ── 并发确认队列 ──────────────────────────────────────────
-// Pi 可能并行调用多个工具，确认框必须串行显示
-
+// Serializes confirmation dialogs so concurrent tool calls don't stack
+// overlapping prompts.
 let confirmQueue: Promise<unknown> = Promise.resolve();
 
 function enqueueConfirm<T>(fn: () => Promise<T>): Promise<T> {
@@ -70,11 +76,9 @@ function enqueueConfirm<T>(fn: () => Promise<T>): Promise<T> {
   return result;
 }
 
-// ── 扩展主体 ──────────────────────────────────────────────
+type UserDecision = "allow" | "deny" | "always-allow" | "always-deny";
 
 export default function extPermissions(pi: ExtensionAPI): void {
-  // ── 初始化 ────────────────────────────────────────────
-
   const paths = getConfigPaths();
   let configs: ConfigSet = loadAllConfigs(paths);
   const modeManager = new ModeManager("auto-edit");
@@ -84,301 +88,351 @@ export default function extPermissions(pi: ExtensionAPI): void {
   };
   const loggedUnknownTools = new Set<string>();
 
-  // ── 生命周期 ──────────────────────────────────────────
+  // ── Lifecycle ──────────────────────────────────────────
 
-  pi.on("session_start", (_event: unknown, ctx: any) => {
+  pi.on("session_start", (_event: SessionStartEvent, ctx: ExtensionContext) => {
     updateStatus(ctx);
   });
 
   const stopWatching = watchConfigs(
     { global: paths.global, project: paths.project },
     (newConfigs) => {
+      // Preserve the factory default; reload only project + global.
       configs = { ...newConfigs, default: configs.default };
-      try {
-        pi.appendSystemMessage?.("[ymp] 权限配置已重新加载。");
-      } catch {
-        // 静默忽略
-      }
+      notify("[ymp] Permission configuration reloaded.", "info");
     },
   );
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (_event: SessionShutdownEvent) => {
     stopWatching();
   });
 
-  // ── 核心：tool_call 拦截器 ────────────────────────────
+  // ── Core: tool_call interceptor ───────────────────────
 
-  pi.on("tool_call", async (event: any, ctx: any) => {
+  pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
     const call: ToolCallInfo = {
       toolName: event.toolName,
-      args: (event.args ?? {}) as Record<string, unknown>,
+      args: (event.input ?? {}) as Record<string, unknown>,
     };
 
-    // 1. 会话级临时覆盖（最高优先级）
+    // 1. Session overrides (highest priority).
     if (overrides.alwaysDeny.has(call.toolName)) {
-      return {
-        blocked: true,
-        reason: `[ymp] 工具 "${call.toolName}" 在本会话中已被标记为始终拒绝。请调整方案。`,
+      const result: ToolCallEventResult = {
+        block: true,
+        reason:
+          `[ymp] Tool "${call.toolName}" was marked always-deny for this session. ` +
+          `Adjust your approach.`,
       };
+      return result;
     }
+    if (overrides.alwaysAllow.has(call.toolName)) return;
 
-    if (overrides.alwaysAllow.has(call.toolName)) {
-      return; // 放行
-    }
-
-    // 2. 规则引擎求值
+    // 2. Rule engine.
     const matchResult: MatchResult = evaluateToolCall(call, configs);
 
-    // 3. 未知工具日志（仅首次）
+    // 3. First-time notice for uncategorized extension tools.
     const toolInfo = getToolInfo(call.toolName);
-    if (toolInfo.category === "unknown" && !toolInfo.builtin) {
+    if (toolInfo.category === DIR.UNKNOWN && !toolInfo.builtin) {
       if (!loggedUnknownTools.has(call.toolName)) {
         loggedUnknownTools.add(call.toolName);
-        try {
-          pi.appendSystemMessage?.(
-            `[ymp] 检测到未分类工具 "${call.toolName}"（来自扩展）。` +
-              `默认需要确认。可在 permissions.yaml 中添加规则。`,
-          );
-        } catch {
-          // 静默忽略
-        }
+        notify(
+          `[ymp] Detected uncategorized tool "${call.toolName}" (from an extension). ` +
+            `It will require confirmation by default. Add a rule in ` +
+            `permissions.yaml to override.`,
+          "warning",
+          ctx,
+        );
       }
     }
 
-    // 4. 审批模式二次映射
+    // 4. Apply approval mode.
     const finalAction = applyMode(modeManager.mode, matchResult.action);
 
-    // 5. 更新状态栏
+    // 5. Refresh footer.
     updateStatus(ctx);
 
-    // 6. 执行动作
+    // 6. Dispatch.
     switch (finalAction) {
       case "allow":
-        return; // 放行
+        return;
 
-      case "deny":
-        return {
-          blocked: true,
+      case "deny": {
+        const result: ToolCallEventResult = {
+          block: true,
           reason: formatDenyReason(call, matchResult),
         };
+        return result;
+      }
 
       case "ask": {
         const decision = await askUser(call, matchResult, ctx);
 
         switch (decision) {
           case "allow":
-            return; // 放行
+            return;
 
           case "always-allow":
             overrides.alwaysAllow.add(call.toolName);
-            return; // 放行
+            return;
 
           case "always-deny":
             overrides.alwaysDeny.add(call.toolName);
             return {
-              blocked: true,
-              reason: `[ymp] 工具 "${call.toolName}" 已被标记为始终拒绝。请调整方案。`,
+              block: true,
+              reason:
+                `[ymp] Tool "${call.toolName}" was marked always-deny for ` +
+                `this session. Adjust your approach.`,
             };
 
           case "deny":
           default:
             return {
-              blocked: true,
-              reason: `[ymp] 用户拒绝了 ${call.toolName} 操作。请调整方案或使用替代方法，不要重试相同操作。`,
+              block: true,
+              reason:
+                `[ymp] User denied the ${call.toolName} call. Adjust your ` +
+                `approach or use an alternative; do not retry the same action.`,
             };
         }
       }
     }
   });
 
-  // ── 用户确认交互 ──────────────────────────────────────
-
-  type UserDecision = "allow" | "deny" | "always-allow" | "always-deny";
+  // ── User confirmation ──────────────────────────────────
 
   async function askUser(
     call: ToolCallInfo,
     match: MatchResult,
-    ctx: any,
+    ctx: ExtensionContext,
   ): Promise<UserDecision> {
-    // 通过队列串行化，避免多个确认框同时弹出
     return enqueueConfirm(async () => {
       const argsSummary = formatArgsSummary(call);
-      const message = [
-        `⚠️  ${call.toolName}`,
-        `   ${argsSummary}`,
-        match.reason ? `   规则: ${match.reason}` : null,
-        `   模式: ${modeManager.mode} | 来源: ${match.scope}`,
-      ]
-        .filter(Boolean)
-        .join("\n");
+      const title = `Confirm ${call.toolName}`;
+      const body = [
+        `${argsSummary}`,
+        match.reason ? `\nReason: ${match.reason}` : "",
+        `\nMode: ${modeManager.mode}   Scope: ${match.scope}`,
+        "\n[Y] Allow once   [N] Deny once   [A] Always allow   [D] Always deny",
+      ].join("");
+
+      const opts: ExtensionUIDialogOptions = { timeout: ASK_TIMEOUT_MS };
 
       try {
-        // 尝试使用 Pi 的确认 UI
-        if (ctx?.ui?.confirm) {
-          const result = await ctx.ui.confirm(message, {
-            choices: [
-              { key: "y", label: "允许本次", value: "allow" },
-              { key: "n", label: "拒绝本次", value: "deny" },
-              {
-                key: "a",
-                label: "本会话始终允许此工具",
-                value: "always-allow",
-              },
-              { key: "d", label: "本会话始终拒绝此工具", value: "always-deny" },
-            ],
-          });
-          if (
-            result === "allow" ||
-            result === "deny" ||
-            result === "always-allow" ||
-            result === "always-deny"
-          ) {
-            return result;
-          }
+        if (ctx.ui.confirm) {
+          const ok = await ctx.ui.confirm(title, body, opts);
+          // Boolean confirms from Pi do not carry the A/D variant, so we
+          // treat Y -> allow and N -> deny. Users wanting A/D can use the
+          // /permissions command to add a session override explicitly.
+          return ok ? "allow" : "deny";
         }
       } catch {
-        // ctx.ui.confirm 不可用、用户按了 Escape、或 API 签名不匹配
-        // 降级为默认拒绝（安全优先）
+        // confirm() may throw on Escape/timeout. Fall through to deny.
       }
 
+      // Safe fallback: deny. Users can still flip to full-auto to skip
+      // prompts entirely.
       return "deny";
     });
   }
 
-  // ── 命令：/mode ───────────────────────────────────────
+  // ── Command: /mode ────────────────────────────────────
 
   pi.registerCommand("mode", {
-    description: `切换审批模式 (${ALL_MODES.join(" | ")})`,
-    handler: async (args: string, ctx: any) => {
+    description: `Switch approval mode (${ALL_MODES.join(" | ")})`,
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
       const target = args?.trim().toLowerCase();
 
-      // 无参数：显示当前模式
-      if (!target) {
+      let output: string;
+
+      if (!target || target === "list") {
         const lines = ALL_MODES.map((m) => {
           const active = m === modeManager.mode;
-          const icon = active ? "●" : "○";
-          const suffix = active ? " ← 当前" : "";
-          return `  ${icon} ${MODE_ICONS[m]} ${m}: ${MODE_DESCRIPTIONS[m]}${suffix}`;
+          const marker = active ? "*" : " ";
+          const suffix = active ? "  (current)" : "";
+          return `  [${marker}] ${MODE_ICONS[m]} ${m}: ${MODE_DESCRIPTIONS[m]}${suffix}`;
         });
-        return [
-          "审批模式:",
+        output = [
+          "Approval modes:",
           ...lines,
           "",
-          `用法: /mode <${ALL_MODES.join(" | ")}>`,
+          `Usage: /mode <${ALL_MODES.join(" | ")}>  (or /mode next to cycle)`,
+        ].join("\n");
+      } else if (target === "next") {
+        const next = modeManager.cycleMode();
+        updateStatus(ctx);
+        output = [
+          `[OK] Cycled to: ${MODE_ICONS[next]} ${next}`,
+          `     ${MODE_DESCRIPTIONS[next]}`,
+          `     (next: ${MODE_ICONS[getNextMode(next)]} ${getNextMode(next)})`,
+        ].join("\n");
+      } else if (!ALL_MODES.includes(target as ApprovalMode)) {
+        output =
+          `[ERR] Unknown mode "${target}". Valid options: ${ALL_MODES.join(" | ")}.`;
+      } else {
+        modeManager.setMode(target as ApprovalMode);
+        updateStatus(ctx);
+        output = [
+          `[OK] Mode set to: ${MODE_ICONS[modeManager.mode]} ${modeManager.mode}`,
+          `     ${MODE_DESCRIPTIONS[modeManager.mode]}`,
         ].join("\n");
       }
 
-      // 有参数：切换模式
-      if (!ALL_MODES.includes(target as ApprovalMode)) {
-        return `❌ 无效模式 "${target}"。可选: ${ALL_MODES.join(" | ")}`;
-      }
-
-      modeManager.setMode(target as ApprovalMode);
-      updateStatus(ctx);
-
-      return [
-        `✅ 审批模式已切换为: ${MODE_ICONS[modeManager.mode]} ${modeManager.mode}`,
-        `   ${MODE_DESCRIPTIONS[modeManager.mode]}`,
-      ].join("\n");
+      notify(output, "info", ctx);
+      return;
     },
   });
 
-  // ── 命令：/permissions ────────────────────────────────
+  // ── Command: /permissions ─────────────────────────────
 
   pi.registerCommand("permissions", {
-    description: "查看当前权限规则与会话状态",
-    handler: async (_args: string, _ctx: any) => {
+    description: "Inspect current permission rules and session state",
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
       const lines: string[] = [];
 
-      // 当前模式
-      lines.push(`模式: ${MODE_ICONS[modeManager.mode]} ${modeManager.mode}`);
+      lines.push(`Mode: ${MODE_ICONS[modeManager.mode]} ${modeManager.mode}`);
       lines.push(`  ${MODE_DESCRIPTIONS[modeManager.mode]}`);
       lines.push("");
 
-      // 配置来源
-      lines.push("配置来源:");
+      lines.push("Configuration sources:");
       lines.push(
-        `  默认规则: ${configs.default ? `${configs.default.rules.length} 条` : "未加载"}`,
+        `  default: ${configs.default ? `${configs.default.rules.length} rule(s)` : "not loaded"}`,
       );
       lines.push(
-        `  全局规则: ${configs.global ? `${configs.global.rules.length} 条` : "无"} (${paths.global})`,
+        `  global:  ${configs.global ? `${configs.global.rules.length} rule(s)` : "none"} (${paths.global})`,
       );
       lines.push(
-        `  项目规则: ${configs.project ? `${configs.project.rules.length} 条` : "无"} (${paths.project})`,
+        `  project: ${configs.project ? `${configs.project.rules.length} rule(s)` : "none"} (${paths.project})`,
       );
       lines.push("");
 
-      // 会话覆盖
-      lines.push("会话覆盖:");
+      lines.push("Session overrides:");
       if (overrides.alwaysAllow.size > 0) {
-        lines.push(`  始终允许: ${[...overrides.alwaysAllow].join(", ")}`);
+        lines.push(`  always-allow: ${[...overrides.alwaysAllow].join(", ")}`);
       }
       if (overrides.alwaysDeny.size > 0) {
-        lines.push(`  始终拒绝: ${[...overrides.alwaysDeny].join(", ")}`);
+        lines.push(`  always-deny:  ${[...overrides.alwaysDeny].join(", ")}`);
       }
-      if (overrides.alwaysAllow.size === 0 && overrides.alwaysDeny.size === 0) {
-        lines.push("  无临时覆盖");
+      if (
+        overrides.alwaysAllow.size === 0 &&
+        overrides.alwaysDeny.size === 0
+      ) {
+        lines.push("  (none)");
       }
-      lines.push("");
 
-      // 未分类工具
       if (loggedUnknownTools.size > 0) {
-        lines.push(`未分类工具: ${[...loggedUnknownTools].join(", ")}`);
-        lines.push("  提示: 在 permissions.yaml 中为这些工具添加规则");
+        lines.push("");
+        lines.push(
+          `Uncategorized tools: ${[...loggedUnknownTools].join(", ")}`,
+        );
+        lines.push("  Tip: add explicit rules for these in permissions.yaml");
       }
 
-      return lines.join("\n");
+      const output = lines.join("\n");
+      notify(output, "info", ctx);
+      updateStatus(ctx);
+      return;
     },
   });
 
-  // ── 状态栏 ────────────────────────────────────────────
+  // ── Always-allow / always-deny helpers ────────────────
 
-  function updateStatus(ctx?: any): void {
-    const text = `${MODE_ICONS[modeManager.mode]} ${modeManager.mode}`;
-    try {
-      if (ctx?.ui?.setStatus) {
-        ctx.ui.setStatus(text);
+  pi.registerCommand("allow", {
+    description: "Mark a tool as always-allow for this session",
+    handler: async (args: string) => {
+      const name = args.trim();
+      if (!name) {
+        notify("Usage: /allow <tool-name>", "warning");
+        return;
       }
+      overrides.alwaysAllow.add(name);
+      overrides.alwaysDeny.delete(name);
+      notify(`[OK] ${name}: always-allow for this session.`);
+      return;
+    },
+  });
+
+  pi.registerCommand("deny", {
+    description: "Mark a tool as always-deny for this session",
+    handler: async (args: string) => {
+      const name = args.trim();
+      if (!name) {
+        notify("Usage: /deny <tool-name>", "warning");
+        return;
+      }
+      overrides.alwaysDeny.add(name);
+      overrides.alwaysAllow.delete(name);
+      notify(`[OK] ${name}: always-deny for this session.`);
+      return;
+    },
+  });
+
+  // ── Output channel ────────────────────────────────────
+
+  /**
+   * Pi's UI exposes exactly one cross-mode channel for transient text
+   * from extensions: `ctx.ui.notify(message, type)`. Other probes used
+   * by earlier versions of this extension (`print`, `appendSystemMessage`,
+   * `pi.appendEntry`) either don't exist or don't render to the user.
+   *
+   * Callers always pass the relevant `ctx` explicitly; this wrapper just
+   * funnels errors through to stderr so operators tee'ing logs see
+   * something even when the UI channel is unavailable.
+   */
+  function notify(
+    message: string,
+    type: "info" | "warning" | "error" = "info",
+    ctx?: ExtensionContext,
+  ): void {
+    const ui = ctx?.ui;
+    if (ui?.notify) {
+      try {
+        ui.notify(message, type);
+        return;
+      } catch {
+        // fall through to stderr
+      }
+    }
+    console.error(`\n${message}\n`);
+  }
+
+  // ── Footer status ─────────────────────────────────────
+
+  function updateStatus(ctx?: ExtensionContext): void {
+    if (!ctx?.ui?.setStatus) return;
+    try {
+      ctx.ui.setStatus(STATUS_KEY, modeManager.statusText);
     } catch {
-      // 状态栏 API 不可用时静默忽略
+      // setStatus may not exist in some contexts; non-fatal.
     }
   }
 
-  // ── 辅助函数 ──────────────────────────────────────────
+  // ── Helpers ───────────────────────────────────────────
 
   function formatDenyReason(call: ToolCallInfo, match: MatchResult): string {
-    const base = match.reason ?? `工具 "${call.toolName}" 被权限规则拒绝`;
-    return `[ymp] ${base}。请调整方案，不要重试相同操作。`;
+    const base = match.reason ?? `Tool "${call.toolName}" was denied by a rule`;
+    return `[ymp] ${base}. Adjust your approach; do not retry the same action.`;
   }
 
   function formatArgsSummary(call: ToolCallInfo): string {
     const args = call.args;
-    let summary: string;
 
-    // bash：显示命令
     if (call.toolName === "bash" && typeof args.command === "string") {
-      summary = args.command;
-    } else {
-      // 文件工具：显示路径
-      const pathKey = ["path", "file", "filePath"].find(
-        (k) => typeof args[k] === "string",
-      );
-      if (pathKey) {
-        summary = String(args[pathKey]);
-      } else {
-        // 其他：JSON 摘要
-        try {
-          summary = JSON.stringify(args);
-        } catch {
-          summary = String(args);
-        }
-      }
+      return truncate(args.command);
     }
 
-    // 截断
-    if (summary.length > MAX_ARGS_DISPLAY) {
-      return `${summary.slice(0, MAX_ARGS_DISPLAY)}… (${summary.length} chars)`;
+    const pathKey = ["path", "file", "filePath"].find(
+      (k) => typeof args[k] === "string",
+    );
+    if (pathKey) return truncate(String(args[pathKey]));
+
+    try {
+      return truncate(JSON.stringify(args));
+    } catch {
+      return truncate(String(args));
     }
-    return summary;
+  }
+
+  function truncate(text: string): string {
+    if (text.length <= MAX_ARGS_DISPLAY) return text;
+    return `${text.slice(0, MAX_ARGS_DISPLAY)}... (${text.length} chars)`;
   }
 }
