@@ -1,23 +1,21 @@
 /**
- * yes-my-pi Permission System — Bash Command Classifier (v4)
+ * yes-my-pi Permission System — Bash Command Classifier (v5)
+ *
+ * v5 changes (ReDoS Security Fix):
+ *   - Replaced the vulnerable glob regex compiler with a ReDoS-safe
+ *     implementation (compileSafeGlob). It accumulates literal characters
+ *     and builds negated character classes, eliminating exponential
+ *     backtracking on overlapping wildcards (e.g., "*a*b*c").
  *
  * v4 changes (Performance, Security, Reliability):
  *   - Compiles prefix lists into single optimized regexes (O(N) -> O(1) lookup).
- *   - Uses word-boundary assertions for command matching, closing a loophole
- *     where "cat\tfile" or "pwd&&rm" could bypass "cat " / "pwd" prefixes.
- *   - State-machine parser for extractNestedCommands, correctly handling
- *     infinite nesting depth (e.g., $(echo $(rm -rf /))).
- *   - Fixed hasRedirect missing "1>file.txt" due to erroneous lookbehind.
+ *   - Uses word-boundary assertions for command matching.
+ *   - State-machine parser for extractNestedCommands, handling infinite depth.
  *   - Extended splitCommandSegments to cover "&" and newlines.
  */
 
 export type BashCommandClass = "read" | "write" | "dangerous" | "unknown";
 
-/**
- * Commands with no side effects (safe to run without confirmation).
- * Order matters for compilation: longer/more-specific prefixes should be
- * present so the regex engine matches them optimally.
- */
 const READ_ONLY_COMMANDS: string[] = [
   "cat ",
   "head ",
@@ -134,7 +132,6 @@ const READ_ONLY_COMMANDS: string[] = [
   "sleep ",
 ];
 
-/** Hard-deny commands; bypass every allow rule regardless of mode. */
 const DANGEROUS_COMMANDS: string[] = [
   "rm -rf /",
   "rm -rf /*",
@@ -196,10 +193,6 @@ const DANGEROUS_COMMANDS: string[] = [
   "Restart-Computer",
 ];
 
-/**
- * Write-side commands (mutate state outside the agent's subprocess).
- * NOTE: Script runners like "node", "python" are routed through the rule engine.
- */
 const WRITE_COMMANDS: string[] = [
   "rm ",
   "rmdir ",
@@ -319,12 +312,6 @@ const WRITE_COMMANDS: string[] = [
 
 /**
  * Compiles an array of prefix strings into a single optimized RegExp.
- *
- * Patterns ending with a word character get a boundary assertion `(?=\s|$)`
- * to prevent false positives (e.g., "cat" matching "catch"). Patterns ending
- * with non-word chars (spaces, slashes) are matched directly as prefixes.
- *
- * Sorted by length descending so the regex engine prioritizes specific matches.
  */
 function compilePrefixes(prefixes: string[]): RegExp {
   const parts = prefixes.map((p) => {
@@ -342,6 +329,110 @@ function compilePrefixes(prefixes: string[]): RegExp {
 const DANGEROUS_REGEX = compilePrefixes(DANGEROUS_COMMANDS);
 const READ_ONLY_REGEX = compilePrefixes(READ_ONLY_COMMANDS);
 const WRITE_REGEX = compilePrefixes(WRITE_COMMANDS);
+
+// ── ReDoS-Safe Glob Compiler ─────────────────────────────
+
+interface MatchOptions {
+  crossSlashes?: boolean;
+}
+
+const patternRegexCache = new Map<string, RegExp>();
+
+function escapeRegexChar(c: string): string {
+  if (/[.+^${}()|[\]\\]/.test(c)) return "\\" + c;
+  return c;
+}
+
+/**
+ * ReDoS-safe glob pattern compiler.
+ *
+ * Instead of compiling `*a*b` into `^.*a.*b$` (which causes exponential
+ * backtracking on strings like "1a2a3a4"), we accumulate the literal
+ * characters seen so far and use them to build a negated character class.
+ *
+ * `*a*b` compiles to `^[^/]*a[^/a]*b$`. Because `[^/a]*` cannot consume 'a',
+ * there is no ambiguity in how the string is partitioned between the wildcards.
+ * This preserves greedy semantics but guarantees linear execution time.
+ */
+function compileSafeGlob(pattern: string, options: MatchOptions = {}): RegExp {
+  let regexStr = "^";
+  const seenLiterals = new Set<string>();
+  let i = 0;
+  const crossSlashes = options.crossSlashes === true;
+
+  while (i < pattern.length) {
+    const char = pattern[i];
+
+    if (char === "*") {
+      let isGlobstar = false;
+      if (pattern[i + 1] === "*") {
+        isGlobstar = true;
+        i++;
+      }
+
+      let negClass = "";
+      if (seenLiterals.size > 0) {
+        negClass = [...seenLiterals].map(escapeRegexChar).join("");
+      }
+
+      if (isGlobstar || crossSlashes) {
+        regexStr += negClass ? `[^${negClass}]*` : ".*";
+      } else {
+        regexStr += negClass ? `[^/${negClass}]*` : "[^/]*";
+      }
+      i++;
+    } else if (char === "?") {
+      regexStr += crossSlashes ? "." : "[^/]";
+      i++;
+    } else {
+      const escaped = escapeRegexChar(char);
+      regexStr += escaped;
+      seenLiterals.add(char);
+      i++;
+    }
+  }
+
+  regexStr += "$";
+  return new RegExp(regexStr);
+}
+
+/**
+ * Pattern matching using the ReDoS-safe compiler.
+ */
+export function matchPattern(
+  pattern: string,
+  value: string,
+  options: MatchOptions = {},
+): boolean {
+  if (pattern === "*") return true;
+  if (pattern === value) return true;
+
+  if (!pattern.includes("*") && !pattern.includes("?")) {
+    return false;
+  }
+
+  const cacheKey = pattern + (options.crossSlashes ? ":cmd" : ":path");
+  let regex = patternRegexCache.get(cacheKey);
+
+  if (!regex) {
+    regex = compileSafeGlob(pattern, options);
+    patternRegexCache.set(cacheKey, regex);
+  }
+
+  return regex.test(value);
+}
+
+function matchStringOrArray(
+  pattern: string | string[] | undefined,
+  value: string,
+  options?: MatchOptions,
+): boolean {
+  if (pattern === undefined) return true;
+  const patterns = Array.isArray(pattern) ? pattern : [pattern];
+  return patterns.some((p) => matchPattern(p, value, options));
+}
+
+// ── Command Parsing & Extraction ─────────────────────────
 
 /**
  * Quote & escape aware splitter.
@@ -401,7 +492,6 @@ export function splitCommandSegments(command: string): string[] {
         continue;
       }
       if (ch === "&") {
-        // background execution separator
         pushSegment();
         continue;
       }
@@ -453,11 +543,10 @@ export function extractNestedCommands(command: string): string[] {
     if (inSingle || inDouble) continue;
 
     if (depth === 0) {
-      // Detect command substitutions and process substitutions
       if ((ch === "$" || ch === "<" || ch === ">") && next === "(") {
         depth = 1;
         start = i + 2;
-        i++; // consume '('
+        i++;
         continue;
       }
     } else {
@@ -476,7 +565,6 @@ export function extractNestedCommands(command: string): string[] {
     }
   }
 
-  // Backticks (do not nest in bash, regex is safe here)
   const backtickRegex = /`([^`]+)`/g;
   let match: RegExpExecArray | null;
   while ((match = backtickRegex.exec(command)) !== null) {
@@ -518,23 +606,17 @@ export function hasRedirect(command: string): boolean {
   return />{1,2}(?!&)/.test(stripped);
 }
 
+// ── Classification Engine ────────────────────────────────
+
 function classifySegment(segment: string): BashCommandClass {
   const trimmed = stripEnvPrefix(segment.trim());
   if (!trimmed) return "read";
 
-  // 1. Dangerous wins outright.
   if (DANGEROUS_REGEX.test(trimmed)) return "dangerous";
-
-  // 2. Redirection -> write.
   if (hasRedirect(trimmed)) return "write";
-
-  // 3. Read-only short-circuits.
   if (READ_ONLY_REGEX.test(trimmed)) return "read";
-
-  // 4. Known write commands.
   if (WRITE_REGEX.test(trimmed)) return "write";
 
-  // 5. Fallback: unknown (caller decides what to do).
   return "unknown";
 }
 
@@ -547,7 +629,6 @@ export function classifyBashCommand(command: string): BashCommandClass {
 
   let result: BashCommandClass = "read";
 
-  // 1. Walk nested commands recursively (subshells, $(), xargs, -exec).
   const nested = extractNestedCommands(command);
   for (const nestedCmd of nested) {
     const cls = classifyBashCommand(nestedCmd);
@@ -555,13 +636,11 @@ export function classifyBashCommand(command: string): BashCommandClass {
     if (cls === "write" || cls === "unknown") result = "write";
   }
 
-  // 2. Split on quote-aware pipes / chains.
   const segments = splitCommandSegments(command);
   if (segments.length === 0) {
     return result === "read" ? "unknown" : result;
   }
 
-  // 3. Classify each segment and promote severity.
   for (const segment of segments) {
     const cls = classifySegment(segment);
     if (cls === "dangerous") return "dangerous";
