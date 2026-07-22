@@ -10,8 +10,11 @@
  *   - /permissions       inspect rules and session overrides
  *   - footer status      reflect the current mode
  *
- * Iron rule: `deny` is absolute — no mode, scope, or user override can
- * regenerate it into anything else.
+ * Iron rule (suggest / auto-edit / full-auto): `deny` is absolute — no
+ * mode, scope, or user override can regenerate it into anything else.
+ * The lone exception is `always-yes`, which converts `deny` to `allow`
+ * AND requires out-of-band confirmation to activate. See
+ * `confirmDangerousMode` below.
  */
 
 import { dirname, join } from "node:path";
@@ -33,6 +36,7 @@ import { loadAllConfigs, watchConfigs, type ConfigSet } from "./src/loader.js";
 import {
   ModeManager,
   applyMode,
+  isDangerousMode,
   MODE_DESCRIPTIONS,
   MODE_ICONS,
   ALL_MODES,
@@ -87,6 +91,11 @@ export default function extPermissions(pi: ExtensionAPI): void {
     alwaysDeny: new Set(),
   };
   const loggedUnknownTools = new Set<string>();
+
+  // Tracks the last mode we pushed to the footer so we only refresh
+  // when the mode actually changed (avoids re-rendering the status bar
+  // on every single tool_call).
+  let lastStatusMode: ApprovalMode | null = null;
 
   // ── Lifecycle ──────────────────────────────────────────
 
@@ -148,7 +157,7 @@ export default function extPermissions(pi: ExtensionAPI): void {
     // 4. Apply approval mode.
     const finalAction = applyMode(modeManager.mode, matchResult.action);
 
-    // 5. Refresh footer.
+    // 5. Refresh footer (cheap when unchanged; see updateStatus).
     updateStatus(ctx);
 
     // 6. Dispatch.
@@ -236,6 +245,55 @@ export default function extPermissions(pi: ExtensionAPI): void {
 
   // ── Command: /mode ────────────────────────────────────
 
+  /**
+   * Out-of-band confirmation gate for entering "dangerous" modes
+   * (currently just `always-yes`). The gate exists because `always-yes`
+   * is the only mode that overrides `deny` rules — e.g. a `deny: rm` or
+   * `deny: curl|bash` rule would otherwise be silently bypassed.
+   *
+   * The gate MUST be confirmed before `setMode` is called; otherwise
+   * the caller's request is ignored. If the confirmation UI is
+   * unavailable, the activation is refused.
+   */
+  async function confirmDangerousMode(
+    target: ApprovalMode,
+    ctx: ExtensionCommandContext,
+  ): Promise<boolean> {
+    if (!isDangerousMode(target)) return true;
+
+    const title = `Confirm: enter ${target} mode`;
+    const body = [
+      `${MODE_ICONS[target]} ${target}: ${MODE_DESCRIPTIONS[target]}`,
+      "",
+      "WARNING: This mode overrides ALL deny rules, including:",
+      "  - destructive commands (rm -rf, sudo, ...)",
+      "  - network/download patterns (curl|bash, wget, ...)",
+      "  - any custom deny rules in permissions.yaml",
+      "",
+      "This change is session-only and lasts until you switch mode again",
+      "or the session ends.",
+      "",
+      "Activate now?",
+    ].join("\n");
+
+    const ui = ctx.ui;
+    if (!ui?.confirm) {
+      notify(
+        `[ERR] Cannot activate ${target}: confirmation UI is unavailable. ` +
+          `Refusing to bypass deny rules.`,
+        "error",
+        ctx,
+      );
+      return false;
+    }
+
+    try {
+      return await ui.confirm(title, body, { timeout: ASK_TIMEOUT_MS });
+    } catch {
+      return false;
+    }
+  }
+
   pi.registerCommand("mode", {
     description: `Switch approval mode (${ALL_MODES.join(" | ")})`,
     handler: async (args: string, ctx: ExtensionCommandContext) => {
@@ -247,33 +305,62 @@ export default function extPermissions(pi: ExtensionAPI): void {
         const lines = ALL_MODES.map((m) => {
           const active = m === modeManager.mode;
           const marker = active ? "*" : " ";
+          const dangerous = isDangerousMode(m) ? "  ⚠ breaks deny rules" : "";
           const suffix = active ? "  (current)" : "";
-          return `  [${marker}] ${MODE_ICONS[m]} ${m}: ${MODE_DESCRIPTIONS[m]}${suffix}`;
+          return `  [${marker}] ${MODE_ICONS[m]} ${m}: ${MODE_DESCRIPTIONS[m]}${dangerous}${suffix}`;
         });
         output = [
           "Approval modes:",
           ...lines,
           "",
           `Usage: /mode <${ALL_MODES.join(" | ")}>  (or /mode next to cycle)`,
+          "Note: modes marked ⚠ require an extra confirmation to activate.",
         ].join("\n");
       } else if (target === "next") {
+        const prev = modeManager.mode;
         const next = modeManager.cycleMode();
+        // Cycling may have landed on a dangerous mode in one step (e.g.
+        // full-auto -> always-yes). We don't gate the cycle itself —
+        // the user explicitly invoked it — but we DO guard the switch.
+        if (isDangerousMode(next)) {
+          const ok = await confirmDangerousMode(next, ctx);
+          if (!ok) {
+            modeManager.setMode(prev);
+            updateStatus(ctx);
+            output = `[CANCEL] Activation of ${MODE_ICONS[next]} ${next} aborted. Mode restored to ${MODE_ICONS[prev]} ${prev}.`;
+            notify(output, "warning", ctx);
+            return;
+          }
+        }
         updateStatus(ctx);
         output = [
           `[OK] Cycled to: ${MODE_ICONS[next]} ${next}`,
           `     ${MODE_DESCRIPTIONS[next]}`,
           `     (next: ${MODE_ICONS[getNextMode(next)]} ${getNextMode(next)})`,
         ].join("\n");
-      } else if (!ALL_MODES.includes(target as ApprovalMode)) {
+      } else if (!(ALL_MODES as readonly string[]).includes(target)) {
         output =
           `[ERR] Unknown mode "${target}". Valid options: ${ALL_MODES.join(" | ")}.`;
       } else {
-        modeManager.setMode(target as ApprovalMode);
-        updateStatus(ctx);
-        output = [
-          `[OK] Mode set to: ${MODE_ICONS[modeManager.mode]} ${modeManager.mode}`,
-          `     ${MODE_DESCRIPTIONS[modeManager.mode]}`,
-        ].join("\n");
+        const apiTarget = target as ApprovalMode;
+        if (modeManager.mode === apiTarget) {
+          output = `[OK] Already in ${MODE_ICONS[apiTarget]} ${apiTarget}.`;
+        } else {
+          const ok = await confirmDangerousMode(apiTarget, ctx);
+          if (!ok) {
+            output =
+              `[CANCEL] Activation of ${MODE_ICONS[apiTarget]} ${apiTarget} aborted. ` +
+              `Current mode unchanged: ${MODE_ICONS[modeManager.mode]} ${modeManager.mode}.`;
+            notify(output, "warning", ctx);
+            return;
+          }
+          modeManager.setMode(apiTarget);
+          updateStatus(ctx);
+          output = [
+            `[OK] Mode set to: ${MODE_ICONS[modeManager.mode]} ${modeManager.mode}`,
+            `     ${MODE_DESCRIPTIONS[modeManager.mode]}`,
+          ].join("\n");
+        }
       }
 
       notify(output, "info", ctx);
@@ -396,8 +483,17 @@ export default function extPermissions(pi: ExtensionAPI): void {
 
   // ── Footer status ─────────────────────────────────────
 
+  /**
+   * Push the current mode to the UI status bar. Skips UI calls when the
+   * mode hasn't changed since the last push, so this is safe to invoke
+   * on every tool_call without causing visible flicker. On the very
+   * first invocation we always push, since `lastStatusMode` is null.
+   */
   function updateStatus(ctx?: ExtensionContext): void {
     if (!ctx?.ui?.setStatus) return;
+    const current = modeManager.mode;
+    if (lastStatusMode === current) return;
+    lastStatusMode = current;
     try {
       ctx.ui.setStatus(STATUS_KEY, modeManager.statusText);
     } catch {

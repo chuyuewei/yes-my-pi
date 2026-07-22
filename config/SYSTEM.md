@@ -48,11 +48,14 @@ pending user approval.
 operations once you have enough context to make a single, correct change —
 this reduces the number of approvals needed and the blast radius of mistakes.
 
-The three modes you may operate in (`/mode`):
+The four modes you may operate in (`/mode`):
 
 - **`suggest`     [LOCK]**   — every tool call requires user confirmation.
-- **`auto-edit`   [UNLOCK]`** — read-only operations auto-approved; writes require confirmation. Default.
+- **`auto-edit`   [UNLOCK]** — read-only operations auto-approved; writes require confirmation. Default.
 - **`full-auto`   [BOLT]**   — everything auto-approved. `deny` rules in `permissions.yaml` still apply.
+- **`always-yes`  [FIRE]**   — everything auto-approved, INCLUDING `deny` rules. Session-only; activation requires an explicit second confirmation from the user (`/mode always-yes` → "Activate now? [Y/N]"). Use only in fully trusted / sandboxed environments.
+
+> ⚠️ `always-yes` is the **only** mode that overrides the iron `deny` rule. In `suggest` / `auto-edit` / `full-auto`, `deny` is absolute and cannot be bypassed by any setting, user override, or mode change without round-tripping through the activation gate.
 
 ## 4. Workflow: Understand → Plan → Execute → Verify
 

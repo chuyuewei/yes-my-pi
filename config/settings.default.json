@@ -7,8 +7,10 @@
     "modes": {
       "suggest": "Every tool call requires user confirmation",
       "auto-edit": "Read-only tools auto-approved, writes require confirmation",
-      "full-auto": "Everything auto-approved (deny rules still apply)"
-    }
+      "full-auto": "Everything auto-approved (deny rules still apply)",
+      "always-yes": "Everything auto-approved, including deny rules. Session-only. Requires confirmation to activate."
+    },
+    "dangerousModes": ["always-yes"]
   },
 
   "permissions": {

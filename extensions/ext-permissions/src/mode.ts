@@ -16,20 +16,40 @@
  *              allow ->     ask ->      deny ->
  *   suggest      ask         ask         deny
  *   auto-edit    allow       ask         deny
- *   full-auto    allow       allow       deny   (iron rule)
+ *   full-auto    allow       allow       deny      (iron rule)
+ *   always-yes   allow       allow       allow     (BREAKS the iron rule)
+ *
+ * `always-yes` is the only mode that overrides `deny`. Activation is
+ * gated behind an out-of-band confirmation because, e.g., a `deny` rule
+ * matching `rm -rf /` would otherwise be silently bypassed.
  */
 
 import type { PermissionAction } from "./types.js";
 
 const LOG_PREFIX = "[ymp-permissions]";
 
-export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
+export type ApprovalMode =
+  | "suggest"
+  | "auto-edit"
+  | "full-auto"
+  | "always-yes";
 
 export const ALL_MODES: readonly ApprovalMode[] = [
   "suggest",
   "auto-edit",
   "full-auto",
+  "always-yes",
 ];
+
+/**
+ * Modes that override the permission system's deny rules. Switching to
+ * one of these requires an explicit second confirmation. Always-allow
+ * tool overrides ("/allow <tool>") are session-scoped and do NOT count
+ * as dangerous — only mode-level overrides do.
+ */
+export const DANGEROUS_MODES: ReadonlySet<ApprovalMode> = new Set([
+  "always-yes",
+]);
 
 export const DEFAULT_MODE: ApprovalMode = "auto-edit";
 
@@ -38,18 +58,22 @@ export const MODE_DESCRIPTIONS: Readonly<Record<ApprovalMode, string>> = {
   "auto-edit":
     "Read-only operations auto-approved, writes require confirmation",
   "full-auto": "Everything auto-approved (deny rules still apply)",
+  "always-yes":
+    "Everything auto-approved, including deny rules. Session-only. Requires confirmation to activate.",
 };
 
 export const MODE_ICONS: Readonly<Record<ApprovalMode, string>> = {
   suggest: "[LOCK]",
   "auto-edit": "[UNLOCK]",
   "full-auto": "[BOLT]",
+  "always-yes": "[FIRE]",
 };
 
 export const MODE_PERMISSIVENESS: Readonly<Record<ApprovalMode, number>> = {
   suggest: 0,
   "auto-edit": 1,
   "full-auto": 2,
+  "always-yes": 3,
 };
 
 export function isApprovalMode(value: unknown): value is ApprovalMode {
@@ -65,7 +89,18 @@ const MODE_TRANSITIONS: Readonly<
   suggest: { allow: "ask", ask: "ask", deny: "deny" },
   "auto-edit": { allow: "allow", ask: "ask", deny: "deny" },
   "full-auto": { allow: "allow", ask: "allow", deny: "deny" },
+  "always-yes": { allow: "allow", ask: "allow", deny: "allow" },
 };
+
+/**
+ * Whether the given mode overrides `deny` rules.
+ *
+ * Used by the activation gate: only "dangerous" modes require the
+ * out-of-band confirmation prompt.
+ */
+export function isDangerousMode(mode: ApprovalMode): boolean {
+  return DANGEROUS_MODES.has(mode);
+}
 
 export function applyMode(
   mode: ApprovalMode,

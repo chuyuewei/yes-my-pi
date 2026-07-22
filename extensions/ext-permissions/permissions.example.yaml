@@ -137,3 +137,25 @@ rules:
   #     command: "./scripts/deploy.sh*"
   #   action: ask
   #   reason: "This script deploys to a shared environment"
+
+  # ── Example: defense-in-depth under `always-yes` mode ───
+  # Note: `always-yes` overrides EVERY deny rule in this file (and in
+  # ~/.pi/agent/permissions.yaml) once the user has activated it via
+  # `/mode always-yes`. There is no rule you can write that survives
+  # `always-yes`. So if `always-yes` is in your threat model, the real
+  # defense must sit outside ymp:
+  #   - container / VM isolation
+  #   - read-only mounts for sensitive paths
+  #   - network egress restriction
+  #   - secrets injected by the orchestrator, not in the repo
+  # The block below is the *last line of defense even without
+  # `always-yes`*: a project-scoped deny list that is meaningful in
+  # suggest / auto-edit / full-auto and inert under always-yes.
+  # - tool: write
+  #   match:
+  #     path:
+  #       - "**/.env.production*"
+  #       - "**/secrets/**"
+  #       - "**/*.pem"
+  #   action: deny
+  #   reason: "Production secrets must not be written by AI"
