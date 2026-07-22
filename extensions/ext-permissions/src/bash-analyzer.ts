@@ -1,5 +1,12 @@
 /**
- * yes-my-pi Permission System — Bash Command Classifier (v5)
+ * yes-my-pi Permission System — Bash Command Classifier (v6)
+ *
+ * v6 changes (ReDoS Security Fix):
+ *   - Fixed stripEnvPrefix: replaced the nested-quantifier regex
+ *     `/^(?:\s*\w+=\S+\s+)+/` (vulnerable to exponential backtracking)
+ *     with a `while` loop driven by a single-assignment regex. This
+ *     guarantees linear time complexity and also adds support for
+ *     quoted values (e.g., `FOO="a b" cmd`).
  *
  * v5 changes (ReDoS Security Fix):
  *   - Replaced the vulnerable glob regex compiler with a ReDoS-safe
@@ -312,6 +319,12 @@ const WRITE_COMMANDS: string[] = [
 
 /**
  * Compiles an array of prefix strings into a single optimized RegExp.
+ *
+ * Patterns ending with a word character get a boundary assertion `(?=\s|$)`
+ * to prevent false positives (e.g., "cat" matching "catch"). Patterns ending
+ * with non-word chars (spaces, slashes) are matched directly as prefixes.
+ *
+ * Sorted by length descending so the regex engine prioritizes specific matches.
  */
 function compilePrefixes(prefixes: string[]): RegExp {
   const parts = prefixes.map((p) => {
@@ -333,6 +346,7 @@ const WRITE_REGEX = compilePrefixes(WRITE_COMMANDS);
 // ── ReDoS-Safe Glob Compiler ─────────────────────────────
 
 interface MatchOptions {
+  /** If true, `*` matches `/` (useful for commands/URLs). Default: false (path semantics). */
   crossSlashes?: boolean;
 }
 
@@ -398,6 +412,11 @@ function compileSafeGlob(pattern: string, options: MatchOptions = {}): RegExp {
 
 /**
  * Pattern matching using the ReDoS-safe compiler.
+ *
+ *   "*"           -> matches everything
+ *   "npm test*"   -> prefix wildcard
+ *   "src/**"      -> path glob (** crosses directories, * single segment)
+ *   no wildcard   -> EXACT match only (no implicit startsWith for security)
  */
 export function matchPattern(
   pattern: string,
@@ -407,6 +426,8 @@ export function matchPattern(
   if (pattern === "*") return true;
   if (pattern === value) return true;
 
+  // No wildcards means strict exact match.
+  // This prevents accidental prefix matches on security-sensitive paths.
   if (!pattern.includes("*") && !pattern.includes("?")) {
     return false;
   }
@@ -436,7 +457,12 @@ function matchStringOrArray(
 
 /**
  * Quote & escape aware splitter.
+ *
+ *   cat "a|b.txt" | grep foo && echo "x;y"
+ *     -> ['cat "a|b.txt"', 'grep foo', 'echo "x;y"']
+ *
  * Supports: |, ||, &&, ;, & (background), \n
+ * Operators inside single or double quotes are NOT treated as splits.
  */
 export function splitCommandSegments(command: string): string[] {
   const segments: string[] = [];
@@ -492,6 +518,7 @@ export function splitCommandSegments(command: string): string[] {
         continue;
       }
       if (ch === "&") {
+        // background execution separator
         pushSegment();
         continue;
       }
@@ -511,6 +538,11 @@ export function splitCommandSegments(command: string): string[] {
 /**
  * Extract nested commands using a state machine.
  * Reliably handles infinite nesting depths for $(), <(), >() which regex fails on.
+ *
+ *   "echo $(rm -rf /)"        -> ["rm -rf /"]
+ *   "bash -c 'rm -rf /'"      -> ["rm -rf /"]
+ *   "find . -exec rm {} \;"   -> ["rm {}"]
+ *   "xargs rm"                -> ["rm"]
  */
 export function extractNestedCommands(command: string): string[] {
   const nested: string[] = [];
@@ -543,10 +575,11 @@ export function extractNestedCommands(command: string): string[] {
     if (inSingle || inDouble) continue;
 
     if (depth === 0) {
+      // Detect command substitutions and process substitutions
       if ((ch === "$" || ch === "<" || ch === ">") && next === "(") {
         depth = 1;
         start = i + 2;
-        i++;
+        i++; // consume '('
         continue;
       }
     } else {
@@ -565,6 +598,7 @@ export function extractNestedCommands(command: string): string[] {
     }
   }
 
+  // Backticks (do not nest in bash, regex is safe here)
   const backtickRegex = /`([^`]+)`/g;
   let match: RegExpExecArray | null;
   while ((match = backtickRegex.exec(command)) !== null) {
@@ -590,9 +624,29 @@ export function extractNestedCommands(command: string): string[] {
   return nested;
 }
 
-/** Strip env-var assignment prefixes: "FOO=bar BAZ=qux rm file" -> "rm file" */
+// Matches a SINGLE env-var assignment prefix (e.g. "FOO=bar ").
+// Supports quoted values (e.g. FOO="a b") without introducing nested
+// unbounded quantifiers.
+const ENV_PREFIX_REGEX = /^[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S*)\s+/;
+
+/**
+ * Strip env-var assignment prefixes: "FOO=bar BAZ=qux rm file" -> "rm file"
+ * Also handles quoted values: `FOO="a b" rm file` -> `rm file`
+ *
+ * Security (CWE-1333): Uses a `while` loop driven by a single-assignment
+ * regex instead of a nested unbounded quantifier (the previous
+ * `/^(?:\s*\w+=\S+\s+)+/` pattern), which was vulnerable to exponential
+ * backtracking (ReDoS). Each iteration runs in linear time, and the loop
+ * bound is naturally capped by the string length.
+ */
 export function stripEnvPrefix(segment: string): string {
-  return segment.replace(/^(?:\s*\w+=\S+\s+)+/, "").trim();
+  let s = segment.trimStart();
+  while (true) {
+    const match = s.match(ENV_PREFIX_REGEX);
+    if (!match) break;
+    s = s.slice(match[0].length);
+  }
+  return s.trim();
 }
 
 /**
@@ -610,25 +664,39 @@ export function hasRedirect(command: string): boolean {
 
 function classifySegment(segment: string): BashCommandClass {
   const trimmed = stripEnvPrefix(segment.trim());
-  if (!trimmed) return "read";
+  if (!trimmed) return "read"; // bare env assignments, nothing to classify
 
+  // 1. Dangerous wins outright.
   if (DANGEROUS_REGEX.test(trimmed)) return "dangerous";
+
+  // 2. Redirection -> write.
   if (hasRedirect(trimmed)) return "write";
+
+  // 3. Read-only short-circuits.
   if (READ_ONLY_REGEX.test(trimmed)) return "read";
+
+  // 4. Known write commands.
   if (WRITE_REGEX.test(trimmed)) return "write";
 
+  // 5. Fallback: unknown (caller decides what to do).
   return "unknown";
 }
 
 /**
  * Classify a whole bash command. Returns the most-strict class found:
  *   dangerous > write/unknown > read
+ *
+ *   1. Walk nested commands recursively (subshells, $(), xargs, -exec).
+ *   2. Split on quote-aware pipes / chains.
+ *   3. Classify each segment.
+ *   4. Promote to the strictest class seen.
  */
 export function classifyBashCommand(command: string): BashCommandClass {
   if (!command || !command.trim()) return "unknown";
 
   let result: BashCommandClass = "read";
 
+  // 1. Walk nested commands recursively (subshells, $(), xargs, -exec).
   const nested = extractNestedCommands(command);
   for (const nestedCmd of nested) {
     const cls = classifyBashCommand(nestedCmd);
@@ -636,11 +704,13 @@ export function classifyBashCommand(command: string): BashCommandClass {
     if (cls === "write" || cls === "unknown") result = "write";
   }
 
+  // 2. Split on quote-aware pipes / chains.
   const segments = splitCommandSegments(command);
   if (segments.length === 0) {
     return result === "read" ? "unknown" : result;
   }
 
+  // 3. Classify each segment and promote severity.
   for (const segment of segments) {
     const cls = classifySegment(segment);
     if (cls === "dangerous") return "dangerous";
