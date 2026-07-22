@@ -11,42 +11,35 @@
  *   - Action severity:    deny > ask > allow
  *   - Scope precedence:   project > global > default
  *   - `deny` is an absolute floor: no scope can override a `deny`.
+ *   - Parsed rules are immutable at runtime (enforced via readonly).
  */
 
 export type PermissionAction = "allow" | "deny" | "ask";
 
-export const PERMISSION_ACTIONS: readonly PermissionAction[] = [
-  "allow",
-  "ask",
-  "deny",
-];
+export const PERMISSION_ACTIONS = ["allow", "ask", "deny"] as const;
+
+// Internal Set for O(1) lookup in high-frequency type guards
+const PERMISSION_ACTION_SET: ReadonlySet<string> = new Set(PERMISSION_ACTIONS);
 
 export function isPermissionAction(value: unknown): value is PermissionAction {
-  return (
-    typeof value === "string" &&
-    (PERMISSION_ACTIONS as readonly string[]).includes(value)
-  );
+  return typeof value === "string" && PERMISSION_ACTION_SET.has(value);
 }
 
-export const ACTION_SEVERITY: Readonly<Record<PermissionAction, number>> = {
+export const ACTION_SEVERITY = {
   allow: 1,
   ask: 2,
   deny: 3,
-};
+} as const satisfies Record<PermissionAction, number>;
 
 export type PermissionScope = "project" | "global" | "default";
 
-export const SCOPE_PRECEDENCE: readonly PermissionScope[] = [
-  "project",
-  "global",
-  "default",
-];
+export const SCOPE_PRECEDENCE = ["project", "global", "default"] as const;
+
+// Internal Set for O(1) lookup
+const SCOPE_SET: ReadonlySet<string> = new Set(SCOPE_PRECEDENCE);
 
 export function isPermissionScope(value: unknown): value is PermissionScope {
-  return (
-    typeof value === "string" &&
-    (SCOPE_PRECEDENCE as readonly string[]).includes(value)
-  );
+  return typeof value === "string" && SCOPE_SET.has(value);
 }
 
 export const CURRENT_CONFIG_VERSION = 1;
@@ -66,9 +59,9 @@ export const WILDCARD_TOOL = "*" as const;
 export type PatternOrList = string | string[];
 
 export interface RuleMatch {
-  command?: PatternOrList;
-  path?: PatternOrList;
-  args?: Record<string, PatternOrList>;
+  readonly command?: PatternOrList;
+  readonly path?: PatternOrList;
+  readonly args?: Record<string, PatternOrList>;
 
   /**
    * Pattern syntax (see `matchPattern` in matcher.ts):
@@ -80,33 +73,33 @@ export interface RuleMatch {
 
 export interface PermissionRule {
   /** Tool name this rule applies to, or "*" to match every tool. */
-  tool: string;
+  readonly tool: string;
   /** Additional match conditions. Omit to match all calls to `tool`. */
-  match?: RuleMatch;
+  readonly match?: RuleMatch;
   /** Action to take when this rule matches. */
-  action: PermissionAction;
+  readonly action: PermissionAction;
   /** Human-readable explanation shown when this rule results in `ask` or `deny`. */
-  reason?: string;
+  readonly reason?: string;
 }
 
 export interface PermissionConfig {
   /** Schema version. Currently only `1` is supported. */
-  version: number;
+  readonly version: number;
   /** Fallback action when no rule in this config matches a call. */
-  defaultAction: PermissionAction;
+  readonly defaultAction: PermissionAction;
   /** Ordered rule list. First-match-wins within a single scope. */
-  rules: readonly PermissionRule[];
+  readonly rules: readonly PermissionRule[];
 }
 
 export interface MatchResult {
-  action: PermissionAction;
+  readonly action: PermissionAction;
   /** The rule that produced this result, absent for pure fallback results. */
-  rule?: PermissionRule;
-  scope: PermissionScope;
-  reason?: string;
+  readonly rule?: PermissionRule;
+  readonly scope: PermissionScope;
+  readonly reason?: string;
 }
 
 export interface ToolCallInfo {
-  toolName: string;
-  args: Record<string, unknown>;
+  readonly toolName: string;
+  readonly args: Record<string, unknown>;
 }

@@ -10,12 +10,25 @@
       "full-auto": "Everything auto-approved (deny rules still apply)",
       "always-yes": "Everything auto-approved, including deny rules. Session-only. Requires confirmation to activate."
     },
-    "dangerousModes": ["always-yes"]
+    "dangerousModes": ["always-yes"],
+    "askTimeoutMs": 60000
   },
 
   "permissions": {
     "rulesFile": "permissions.default.yaml",
-    "sessionOverrides": true
+    "globalRulesPath": "~/.pi/agent/permissions.yaml",
+    "projectRulesPath": ".pi/permissions.yaml",
+    "sessionOverrides": true,
+    "watcher": {
+      "enabled": true,
+      "debounceMs": 150,
+      "pollIntervalMs": 1000
+    }
+  },
+
+  "ui": {
+    "statusKey": "ymp-mode",
+    "maxArgsDisplay": 200
   },
 
   "identity": {

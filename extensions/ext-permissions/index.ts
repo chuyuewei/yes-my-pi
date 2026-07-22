@@ -41,6 +41,7 @@ import {
   MODE_ICONS,
   ALL_MODES,
   getNextMode,
+  DEFAULT_MODE,
   type ApprovalMode,
 } from "./src/mode.js";
 import { getToolInfo } from "./src/tool-registry.js";
@@ -52,7 +53,12 @@ const MAX_ARGS_DISPLAY = 200;
 const STATUS_KEY = "ymp-mode";
 const ASK_TIMEOUT_MS = 60_000;
 
-const DIR = { READ: "read", WRITE: "write", MIXED: "mixed", UNKNOWN: "unknown" };
+const DIR = {
+  READ: "read",
+  WRITE: "write",
+  MIXED: "mixed",
+  UNKNOWN: "unknown",
+};
 
 function getConfigPaths() {
   return {
@@ -85,7 +91,7 @@ type UserDecision = "allow" | "deny" | "always-allow" | "always-deny";
 export default function extPermissions(pi: ExtensionAPI): void {
   const paths = getConfigPaths();
   let configs: ConfigSet = loadAllConfigs(paths);
-  const modeManager = new ModeManager("auto-edit");
+  const modeManager = new ModeManager(DEFAULT_MODE);
   const overrides: SessionOverrides = {
     alwaysAllow: new Set(),
     alwaysDeny: new Set(),
@@ -103,14 +109,10 @@ export default function extPermissions(pi: ExtensionAPI): void {
     updateStatus(ctx);
   });
 
-  const stopWatching = watchConfigs(
-    { global: paths.global, project: paths.project },
-    (newConfigs) => {
-      // Preserve the factory default; reload only project + global.
-      configs = { ...newConfigs, default: configs.default };
-      notify("[ymp] Permission configuration reloaded.", "info");
-    },
-  );
+  const stopWatching = watchConfigs(paths, (newConfigs) => {
+    configs = newConfigs;
+    notify("[ymp] Permission configuration reloaded.", "info");
+  });
 
   pi.on("session_shutdown", (_event: SessionShutdownEvent) => {
     stopWatching();
@@ -124,7 +126,19 @@ export default function extPermissions(pi: ExtensionAPI): void {
       args: (event.input ?? {}) as Record<string, unknown>,
     };
 
-    // 1. Session overrides (highest priority).
+    // 1. Rule engine evaluation MUST happen first to establish the deny floor.
+    // A user's session override ("always-allow") cannot bypass a hard "deny" rule.
+    const matchResult: MatchResult = evaluateToolCall(call, configs);
+
+    if (matchResult.action === "deny") {
+      const result: ToolCallEventResult = {
+        block: true,
+        reason: formatDenyReason(call, matchResult),
+      };
+      return result;
+    }
+
+    // 2. Session overrides (highest priority for non-deny actions).
     if (overrides.alwaysDeny.has(call.toolName)) {
       const result: ToolCallEventResult = {
         block: true,
@@ -134,10 +148,8 @@ export default function extPermissions(pi: ExtensionAPI): void {
       };
       return result;
     }
-    if (overrides.alwaysAllow.has(call.toolName)) return;
 
-    // 2. Rule engine.
-    const matchResult: MatchResult = evaluateToolCall(call, configs);
+    if (overrides.alwaysAllow.has(call.toolName)) return;
 
     // 3. First-time notice for uncategorized extension tools.
     const toolInfo = getToolInfo(call.toolName);
@@ -166,6 +178,7 @@ export default function extPermissions(pi: ExtensionAPI): void {
         return;
 
       case "deny": {
+        // Reached if a future mode maps ask/allow to deny, or fallback logic.
         const result: ToolCallEventResult = {
           block: true,
           reason: formatDenyReason(call, matchResult),
@@ -220,7 +233,8 @@ export default function extPermissions(pi: ExtensionAPI): void {
         `${argsSummary}`,
         match.reason ? `\nReason: ${match.reason}` : "",
         `\nMode: ${modeManager.mode}   Scope: ${match.scope}`,
-        "\n[Y] Allow once   [N] Deny once   [A] Always allow   [D] Always deny",
+        "\n[Y] Allow once   [N] Deny once",
+        "\n(Tip: Use /allow <tool> or /deny <tool> for session overrides)",
       ].join("");
 
       const opts: ExtensionUIDialogOptions = { timeout: ASK_TIMEOUT_MS };
@@ -228,9 +242,7 @@ export default function extPermissions(pi: ExtensionAPI): void {
       try {
         if (ctx.ui.confirm) {
           const ok = await ctx.ui.confirm(title, body, opts);
-          // Boolean confirms from Pi do not carry the A/D variant, so we
-          // treat Y -> allow and N -> deny. Users wanting A/D can use the
-          // /permissions command to add a session override explicitly.
+          // Boolean confirms from Pi do not carry the A/D variant.
           return ok ? "allow" : "deny";
         }
       } catch {
@@ -317,21 +329,19 @@ export default function extPermissions(pi: ExtensionAPI): void {
           "Note: modes marked ⚠ require an extra confirmation to activate.",
         ].join("\n");
       } else if (target === "next") {
-        const prev = modeManager.mode;
-        const next = modeManager.cycleMode();
-        // Cycling may have landed on a dangerous mode in one step (e.g.
-        // full-auto -> always-yes). We don't gate the cycle itself —
-        // the user explicitly invoked it — but we DO guard the switch.
+        // Pre-compute next mode to validate danger before mutation.
+        const next = getNextMode(modeManager.mode);
+
         if (isDangerousMode(next)) {
           const ok = await confirmDangerousMode(next, ctx);
           if (!ok) {
-            modeManager.setMode(prev);
-            updateStatus(ctx);
-            output = `[CANCEL] Activation of ${MODE_ICONS[next]} ${next} aborted. Mode restored to ${MODE_ICONS[prev]} ${prev}.`;
+            output = `[CANCEL] Activation of ${MODE_ICONS[next]} ${next} aborted. Mode remains ${MODE_ICONS[modeManager.mode]} ${modeManager.mode}.`;
             notify(output, "warning", ctx);
             return;
           }
         }
+
+        modeManager.setMode(next);
         updateStatus(ctx);
         output = [
           `[OK] Cycled to: ${MODE_ICONS[next]} ${next}`,
@@ -339,8 +349,7 @@ export default function extPermissions(pi: ExtensionAPI): void {
           `     (next: ${MODE_ICONS[getNextMode(next)]} ${getNextMode(next)})`,
         ].join("\n");
       } else if (!(ALL_MODES as readonly string[]).includes(target)) {
-        output =
-          `[ERR] Unknown mode "${target}". Valid options: ${ALL_MODES.join(" | ")}.`;
+        output = `[ERR] Unknown mode "${target}". Valid options: ${ALL_MODES.join(" | ")}.`;
       } else {
         const apiTarget = target as ApprovalMode;
         if (modeManager.mode === apiTarget) {
@@ -398,10 +407,7 @@ export default function extPermissions(pi: ExtensionAPI): void {
       if (overrides.alwaysDeny.size > 0) {
         lines.push(`  always-deny:  ${[...overrides.alwaysDeny].join(", ")}`);
       }
-      if (
-        overrides.alwaysAllow.size === 0 &&
-        overrides.alwaysDeny.size === 0
-      ) {
+      if (overrides.alwaysAllow.size === 0 && overrides.alwaysDeny.size === 0) {
         lines.push("  (none)");
       }
 

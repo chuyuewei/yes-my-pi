@@ -29,11 +29,16 @@
 #
 # 4. Pattern matching:
 #      "npm test"      exact match only (no wildcard = exact)
-#      "npm test*"     prefix wildcard — matches "npm test -- --watch"
-#      "src/**/*.ts"   glob — matches any .ts file under src/, any depth
-#      "*.env"         matches any single path segment ending in .env
-#      "*"             matches anything
-#    A pattern can be a single string or a list of strings (OR logic).
+#      "npm test*"     wildcard — matches any sequence
+#      "src/**/*.ts"   path glob — matches any .ts file under src/, any depth
+#
+#    CRITICAL DIFFERENCE IN WILDCARD BEHAVIOR:
+#      - For `path` patterns: "*" does NOT cross "/" (single segment).
+#        Use "**" to cross directories.
+#      - For `command` patterns: "*" CROSSES spaces and slashes.
+#        e.g., "git push*--force*" catches flags regardless of argument order.
+#        Avoid writing "curl * | bash" (fails on multiple spaces);
+#        use "curl*|*bash*" instead.
 #
 # ─────────────────────────────────────────────────────────────
 
@@ -65,34 +70,22 @@ rules:
   #   action: deny
   #   reason: "This agent is scoped to packages/my-app only"
 
-  # ── Example: protect sensitive files ────────────────────────
-  # Note: patterns must account for the fact that unmatched patterns
-  # are EXACT matches only. Use "**" to cover subdirectories, and
-  # list common variants (e.g. `.env.production.local`) explicitly —
-  # don't assume a single pattern catches every case.
-  - tool: write
+  # ── Example: protect sensitive files (read & write) ─────────
+  # Using `tool: "*"` with a `path` matcher blocks ANY file-based tool
+  # (read, write, edit, or extension tools) from touching these files.
+  # This prevents the AI from reading secrets and exfiltrating them.
+  - tool: "*"
     match:
       path:
-        - "**/.env.production"
-        - "**/.env.production.*"
+        - "**/.env"
+        - "**/.env.*"
         - "**/.env*.local"
         - "**/secrets/**"
         - "**/*.pem"
+        - "**/*.key"
         - "**/id_rsa*"
     action: deny
-    reason: "Production config / credentials must not be modified by AI"
-
-  - tool: edit
-    match:
-      path:
-        - "**/.env.production"
-        - "**/.env.production.*"
-        - "**/.env*.local"
-        - "**/secrets/**"
-        - "**/*.pem"
-        - "**/id_rsa*"
-    action: deny
-    reason: "Production config / credentials must not be modified by AI"
+    reason: "Production config / credentials must not be accessed or modified by AI"
 
   # ── Example: allow reading a specific directory freely ──────
   # - tool: read
@@ -122,7 +115,8 @@ rules:
   # ── Example: tighten default network access rules ───────────
   # The factory default doesn't hard-deny curl/wget (some workflows
   # need them). Uncomment to forbid outbound network calls entirely
-  # in this project.
+  # in this project. Notice the lack of spaces around `*` to reliably
+  # catch all argument variations.
   # - tool: bash
   #   match:
   #     command:
@@ -151,7 +145,7 @@ rules:
   # The block below is the *last line of defense even without
   # `always-yes`*: a project-scoped deny list that is meaningful in
   # suggest / auto-edit / full-auto and inert under always-yes.
-  # - tool: write
+  # - tool: "*"
   #   match:
   #     path:
   #       - "**/.env.production*"

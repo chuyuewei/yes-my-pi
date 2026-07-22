@@ -8,7 +8,7 @@
  *   4. Hot-reload with debounced file watching.
  */
 
-import { watchFile, unwatchFile, readFileSync, statSync } from "node:fs";
+import { watchFile, unwatchFile, readFileSync } from "node:fs";
 import { parse } from "yaml";
 import {
   isPermissionAction,
@@ -57,7 +57,10 @@ export function validateConfig(config: unknown): ValidationResult {
   }
 
   // 2. defaultAction.
-  if (cfg.defaultAction !== undefined && !isPermissionAction(cfg.defaultAction)) {
+  if (
+    cfg.defaultAction !== undefined &&
+    !isPermissionAction(cfg.defaultAction)
+  ) {
     errors.push(
       `Invalid defaultAction "${cfg.defaultAction}". Must be allow, ask, or deny.`,
     );
@@ -110,12 +113,11 @@ export function validateConfig(config: unknown): ValidationResult {
 
 /**
  * Read+parse a file safely. Returns undefined if missing or unreadable.
- * Uses statSync to atomically check existence, avoiding the
- * TOCTOU race between existsSync and readFileSync.
+ * Optimized: directly attempts readFileSync and catches ENOENT, avoiding
+ * the extra system call from statSync and eliminating TOCTOU races.
  */
 function readYamlFile(filePath: string): unknown | undefined {
   try {
-    statSync(filePath);
     return parse(readFileSync(filePath, "utf-8"));
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -174,10 +176,11 @@ export function loadAllConfigs(paths: {
  * Watch global and project config files for changes; debounced reload.
  *
  * Returns an unsubscribe function. The default config is read-only and
- * lives alongside the extension package, so it is NOT watched.
+ * lives alongside the extension package, so it is NOT watched, but it
+ * IS included in the onChange payload to maintain a complete ConfigSet.
  */
 export function watchConfigs(
-  paths: { global: string; project: string },
+  paths: { global: string; project: string; default: string },
   onChange: (configs: ConfigSet) => void,
 ): UnsubscribeFn {
   const targets = [paths.global, paths.project];
@@ -187,10 +190,12 @@ export function watchConfigs(
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       console.log(`${LOG_PREFIX} Configuration change detected, reloading...`);
-      onChange({
-        project: loadConfigFromFile(paths.project),
-        global: loadConfigFromFile(paths.global),
-      });
+      try {
+        // Ensure the complete ConfigSet is passed, including unwatched defaults
+        onChange(loadAllConfigs(paths));
+      } catch (err) {
+        console.error(`${LOG_PREFIX} Error during config reload:`, err);
+      }
     }, WATCH_DEBOUNCE_MS);
   };
 

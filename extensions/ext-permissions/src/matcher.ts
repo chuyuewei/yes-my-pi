@@ -4,13 +4,12 @@
  * Pure functions; no Pi dependencies, fully testable in isolation.
  *
  * Evaluation semantics:
- *   - Action severity:    deny > ask > allow
- *   - Scope precedence:   project > global > default
- *   - Fallback chain:     YAML rule -> bash classifier -> tool registry -> defaultAction
+ *   - Deny Floor:          A 'deny' in ANY scope is an absolute floor.
+ *   - Cascading Override:  project > global > default (first-match-wins).
+ *   - Fallback chain:      YAML rule -> bash classifier -> tool registry -> defaultAction
  */
 
 import {
-  ACTION_SEVERITY,
   type MatchResult,
   type PermissionConfig,
   type PermissionRule,
@@ -19,48 +18,62 @@ import {
 import { classifyBashCommand } from "./bash-analyzer.js";
 import { getToolCategory } from "./tool-registry.js";
 
+interface MatchOptions {
+  /** If true, `*` matches `/` (useful for commands/URLs). Default: false (path semantics). */
+  crossSlashes?: boolean;
+}
+
+const patternRegexCache = new Map<string, RegExp>();
+
 /**
  * Pattern matching:
  *   "*"           -> matches everything
  *   "npm test*"   -> prefix wildcard
  *   "src/**"      -> path glob (** crosses directories, * single segment)
- *   no wildcard   -> exact match (or startsWith fallback)
+ *   no wildcard   -> EXACT match only (no implicit startsWith for security)
  */
-export function matchPattern(pattern: string, value: string): boolean {
+export function matchPattern(
+  pattern: string,
+  value: string,
+  options: MatchOptions = {},
+): boolean {
   if (pattern === "*") return true;
+  if (pattern === value) return true;
 
-  // Prefix wildcard ("npm test*")
-  if (pattern.endsWith("*") && !pattern.includes("**")) {
-    return value.startsWith(pattern.slice(0, -1));
+  // No wildcards means strict exact match.
+  // This prevents accidental prefix matches on security-sensitive paths.
+  if (!pattern.includes("*") && !pattern.includes("?")) {
+    return false;
   }
 
-  // Glob (** | *)
-  if (pattern.includes("**") || pattern.includes("*")) {
-    const regexStr =
-      "^" +
-      pattern
-        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-        .replace(/\*\*/g, "§GLOBSTAR§")
-        .replace(/\*/g, "[^/]*")
-        .replace(/§GLOBSTAR§/g, ".*") +
-      "$";
-    try {
-      return new RegExp(regexStr).test(value);
-    } catch {
-      return value.startsWith(pattern);
-    }
+  const cacheKey = pattern + (options.crossSlashes ? ":cmd" : ":path");
+  let regex = patternRegexCache.get(cacheKey);
+
+  if (!regex) {
+    const starMatch = options.crossSlashes ? ".*" : "[^/]*";
+    const questionMatch = options.crossSlashes ? "." : "[^/]";
+
+    const source = pattern
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&") // Escape regex special chars
+      .replace(/\*\*/g, ".*") // ** always matches everything
+      .replace(/\*/g, starMatch) // * respects crossSlashes option
+      .replace(/\?/g, questionMatch); // ? respects crossSlashes option
+
+    regex = new RegExp(`^${source}$`);
+    patternRegexCache.set(cacheKey, regex);
   }
 
-  return value === pattern || value.startsWith(pattern);
+  return regex.test(value);
 }
 
 function matchStringOrArray(
   pattern: string | string[] | undefined,
   value: string,
+  options?: MatchOptions,
 ): boolean {
   if (pattern === undefined) return true;
   const patterns = Array.isArray(pattern) ? pattern : [pattern];
-  return patterns.some((p) => matchPattern(p, value));
+  return patterns.some((p) => matchPattern(p, value, options));
 }
 
 export function matchRule(rule: PermissionRule, call: ToolCallInfo): boolean {
@@ -71,13 +84,15 @@ export function matchRule(rule: PermissionRule, call: ToolCallInfo): boolean {
 
   if (command !== undefined && call.toolName === "bash") {
     const cmd = String(call.args.command ?? "");
-    if (!matchStringOrArray(command, cmd)) return false;
+    // Commands can contain slashes (e.g. URLs), so * should cross slashes
+    if (!matchStringOrArray(command, cmd, { crossSlashes: true })) return false;
   }
 
   if (path !== undefined) {
     const filePath = String(
       call.args.path ?? call.args.file ?? call.args.filePath ?? "",
     );
+    // Paths use standard glob semantics where * doesn't cross /
     if (!matchStringOrArray(path, filePath)) return false;
   }
 
@@ -91,48 +106,15 @@ export function matchRule(rule: PermissionRule, call: ToolCallInfo): boolean {
   return true;
 }
 
-/**
- * Within a single scope: keep the highest-severity match. `deny` short-
- * circuits the scan since no later rule can raise severity further.
- */
-function evaluateConfig(
-  config: PermissionConfig,
-  call: ToolCallInfo,
-  scope: MatchResult["scope"],
-): MatchResult | undefined {
-  let best:
-    | { rule: PermissionRule; action: PermissionRule["action"] }
-    | undefined;
-
-  for (const rule of config.rules) {
-    if (!matchRule(rule, call)) continue;
-
-    if (
-      !best ||
-      ACTION_SEVERITY[rule.action] > ACTION_SEVERITY[best.action]
-    ) {
-      best = { rule, action: rule.action };
-    }
-    if (rule.action === "deny") break;
-  }
-
-  if (!best) return undefined;
-  return {
-    action: best.action,
-    rule: best.rule,
-    scope,
-    reason: best.rule.reason,
-  };
-}
-
-function evaluateBashClassifier(
-  call: ToolCallInfo,
-): MatchResult | undefined {
+function evaluateBashClassifier(call: ToolCallInfo): MatchResult | undefined {
   if (call.toolName !== "bash") return undefined;
 
   const cmd = String(call.args.command ?? "");
   const cls = classifyBashCommand(cmd);
-  const preview = cmd.length > 80 ? cmd.slice(0, 80) + "..." : cmd;
+
+  // Collapse whitespaces for clean logging preview
+  const safeCmd = cmd.replace(/\s+/g, " ").trim();
+  const preview = safeCmd.length > 80 ? safeCmd.slice(0, 80) + "..." : safeCmd;
 
   switch (cls) {
     case "dangerous":
@@ -153,9 +135,7 @@ function evaluateBashClassifier(
   }
 }
 
-function evaluateToolRegistry(
-  call: ToolCallInfo,
-): MatchResult | undefined {
+function evaluateToolRegistry(call: ToolCallInfo): MatchResult | undefined {
   if (call.toolName === "bash") return undefined;
 
   switch (getToolCategory(call.toolName)) {
@@ -185,8 +165,13 @@ function evaluateToolRegistry(
 }
 
 /**
- * Evaluate a tool call against all configured scopes + falls-through
- * classifiers. Returns the strictest (highest-severity) result.
+ * Evaluate a tool call against all configured scopes + falls-through classifiers.
+ *
+ * Resolution Model:
+ * 1. Deny Floor: If ANY scope has a matching 'deny', deny immediately.
+ * 2. Cascading Override: Check scopes in priority (project > global > default).
+ *    First matching rule in the highest priority scope wins.
+ * 3. Fallbacks: Bash classifier -> Tool registry -> defaultAction.
  */
 export function evaluateToolCall(
   call: ToolCallInfo,
@@ -196,34 +181,47 @@ export function evaluateToolCall(
     default?: PermissionConfig;
   },
 ): MatchResult {
-  const results: MatchResult[] = [];
+  const scopes: Array<{
+    scope: MatchResult["scope"];
+    config: PermissionConfig;
+  }> = [];
+  if (configs.project)
+    scopes.push({ scope: "project", config: configs.project });
+  if (configs.global) scopes.push({ scope: "global", config: configs.global });
+  if (configs.default)
+    scopes.push({ scope: "default", config: configs.default });
 
-  if (configs.project) {
-    const r = evaluateConfig(configs.project, call, "project");
-    if (r) results.push(r);
-  }
-  if (configs.global) {
-    const r = evaluateConfig(configs.global, call, "global");
-    if (r) results.push(r);
-  }
-  if (configs.default) {
-    const r = evaluateConfig(configs.default, call, "default");
-    if (r) results.push(r);
+  // Pass 1: Deny floor — checked across ALL scopes before anything else.
+  for (const { scope, config } of scopes) {
+    for (const rule of config.rules) {
+      if (rule.action === "deny" && matchRule(rule, call)) {
+        return { action: "deny", rule, scope, reason: rule.reason };
+      }
+    }
   }
 
+  // Pass 2: Cascading first-match-wins per scope, in priority order.
+  for (const { scope, config } of scopes) {
+    for (const rule of config.rules) {
+      if (matchRule(rule, call)) {
+        return { action: rule.action, rule, scope, reason: rule.reason };
+      }
+    }
+  }
+
+  // Pass 3: Dynamic fallbacks (Bash classifier & Tool registry)
   const bashResult = evaluateBashClassifier(call);
-  if (bashResult) results.push(bashResult);
+  if (bashResult) return bashResult;
 
   const registryResult = evaluateToolRegistry(call);
-  if (registryResult) results.push(registryResult);
+  if (registryResult) return registryResult;
 
-  if (results.length === 0) {
-    return {
-      action: configs.default?.defaultAction ?? "ask",
-      scope: "default",
-    };
-  }
+  // Pass 4: defaultAction fallback (project overrides global overrides default)
+  const fallbackAction =
+    configs.project?.defaultAction ??
+    configs.global?.defaultAction ??
+    configs.default?.defaultAction ??
+    "ask";
 
-  results.sort((a, b) => ACTION_SEVERITY[b.action] - ACTION_SEVERITY[a.action]);
-  return results[0];
+  return { action: fallbackAction, scope: "default" };
 }

@@ -12,21 +12,60 @@
 export type ToolCategory = "read" | "write" | "mixed" | "unknown";
 
 export interface ToolInfo {
-  name: string;
-  category: ToolCategory;
-  description: string;
-  builtin: boolean;
+  readonly name: string;
+  readonly category: ToolCategory;
+  readonly description: string;
+  readonly builtin: boolean;
 }
 
-const BUILTIN_TOOLS: ToolInfo[] = [
-  { name: "read", category: "read", description: "Read file contents", builtin: true },
-  { name: "grep", category: "read", description: "Search file contents", builtin: true },
+const BUILTIN_TOOLS: readonly ToolInfo[] = [
+  {
+    name: "read",
+    category: "read",
+    description: "Read file contents",
+    builtin: true,
+  },
+  {
+    name: "grep",
+    category: "read",
+    description: "Search file contents",
+    builtin: true,
+  },
   { name: "find", category: "read", description: "Find files", builtin: true },
-  { name: "ls",   category: "read", description: "List directory contents", builtin: true },
-  { name: "write", category: "write", description: "Create or overwrite a file", builtin: true },
-  { name: "edit",  category: "write", description: "Precise file edit (find/replace)", builtin: true },
-  { name: "bash",  category: "mixed", description: "Execute shell command (requires sub-analysis)", builtin: true },
-];
+  {
+    name: "ls",
+    category: "read",
+    description: "List directory contents",
+    builtin: true,
+  },
+  {
+    name: "write",
+    category: "write",
+    description: "Create or overwrite a file",
+    builtin: true,
+  },
+  {
+    name: "edit",
+    category: "write",
+    description: "Precise file edit (find/replace)",
+    builtin: true,
+  },
+  {
+    name: "bash",
+    category: "mixed",
+    description: "Execute shell command (requires sub-analysis)",
+    builtin: true,
+  },
+].map(Object.freeze); // Deep freeze builtin definitions to prevent runtime tampering
+
+// Pre-allocated frozen fallback object for unknown tools (Zero-allocation O(1) lookup)
+const UNKNOWN_TOOL_TEMPLATE: ToolInfo = Object.freeze({
+  name: "", // Name will be dynamically assigned in a lightweight wrapper if needed,
+  // but for safety we return a read-only shape.
+  category: "unknown",
+  description: "Extension-registered tool (uncategorized)",
+  builtin: false,
+});
 
 const registry = new Map<string, ToolInfo>();
 for (const tool of BUILTIN_TOOLS) {
@@ -38,30 +77,57 @@ export function getToolCategory(toolName: string): ToolCategory {
 }
 
 export function getToolInfo(toolName: string): ToolInfo {
-  return (
-    registry.get(toolName) ?? {
-      name: toolName,
-      category: "unknown",
-      description: "Extension-registered tool (uncategorized)",
-      builtin: false,
-    }
-  );
+  const existing = registry.get(toolName);
+  if (existing) {
+    return existing;
+  }
+
+  // Return a new lightweight object for the specific unknown tool name.
+  // We don't cache this to avoid unbounded Map growth from arbitrary/malicious names.
+  return Object.freeze({
+    ...UNKNOWN_TOOL_TEMPLATE,
+    name: toolName,
+  });
 }
 
 export function isReadOnlyTool(toolName: string): boolean {
   return getToolCategory(toolName) === "read";
 }
 
+/**
+ * Registers a new tool or updates an existing extension tool.
+ *
+ * Security: Throws an error if attempting to overwrite a built-in tool.
+ * This prevents malicious extensions from reclassifying secure tools
+ * (like changing `bash` to `read` to bypass the classifier).
+ *
+ * Reliability: The input info is frozen before storage to ensure
+ * immutability across the application lifecycle.
+ */
 export function registerTool(info: ToolInfo): void {
-  registry.set(info.name, info);
+  const existing = registry.get(info.name);
+
+  if (existing?.builtin) {
+    throw new Error(
+      `[ymp-permissions] Security Error: Cannot overwrite built-in tool "${info.name}".`,
+    );
+  }
+
+  // Enforce immutability on stored references
+  const frozenInfo = Object.freeze({ ...info });
+  registry.set(frozenInfo.name, frozenInfo);
 }
 
 export function getAllTools(): ToolInfo[] {
-  return [...registry.values()];
+  return Array.from(registry.values());
 }
 
 export function getUncategorizedTools(): string[] {
-  return [...registry.values()]
-    .filter((t) => t.category === "unknown" && !t.builtin)
-    .map((t) => t.name);
+  const result: string[] = [];
+  for (const tool of registry.values()) {
+    if (tool.category === "unknown" && !tool.builtin) {
+      result.push(tool.name);
+    }
+  }
+  return result;
 }

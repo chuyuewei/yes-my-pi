@@ -5,7 +5,7 @@
   "type": "module",
   "main": "index.ts",
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.80.0"
+    "@earendil-works/pi-coding-agent": ">=0.81.1"
   },
   "dependencies": {
     "yaml": "^2.9.0"

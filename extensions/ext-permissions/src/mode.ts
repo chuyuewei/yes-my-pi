@@ -28,11 +28,7 @@ import type { PermissionAction } from "./types.js";
 
 const LOG_PREFIX = "[ymp-permissions]";
 
-export type ApprovalMode =
-  | "suggest"
-  | "auto-edit"
-  | "full-auto"
-  | "always-yes";
+export type ApprovalMode = "suggest" | "auto-edit" | "full-auto" | "always-yes";
 
 export const ALL_MODES: readonly ApprovalMode[] = [
   "suggest",
@@ -83,14 +79,15 @@ export function isApprovalMode(value: unknown): value is ApprovalMode {
   );
 }
 
-const MODE_TRANSITIONS: Readonly<
-  Record<ApprovalMode, Readonly<Record<PermissionAction, PermissionAction>>>
-> = {
+const MODE_TRANSITIONS = {
   suggest: { allow: "ask", ask: "ask", deny: "deny" },
   "auto-edit": { allow: "allow", ask: "ask", deny: "deny" },
   "full-auto": { allow: "allow", ask: "allow", deny: "deny" },
   "always-yes": { allow: "allow", ask: "allow", deny: "allow" },
-};
+} as const satisfies Record<
+  ApprovalMode,
+  Record<PermissionAction, PermissionAction>
+>;
 
 /**
  * Whether the given mode overrides `deny` rules.
@@ -106,7 +103,11 @@ export function applyMode(
   mode: ApprovalMode,
   ruleAction: PermissionAction,
 ): PermissionAction {
-  return MODE_TRANSITIONS[mode][ruleAction];
+  // Defensive runtime fallback: if an unknown mode/action slips through
+  // (e.g., via improper type casting), default to the safest action.
+  const transitions = MODE_TRANSITIONS[mode];
+  const result = transitions?.[ruleAction];
+  return result ?? "deny";
 }
 
 export function getNextMode(mode: ApprovalMode): ApprovalMode {
@@ -130,18 +131,36 @@ export class ModeManager {
     return this._mode;
   }
 
-  setMode(mode: ApprovalMode): void {
+  /**
+   * Sets the active mode and notifies all listeners.
+   *
+   * Security: If the target mode is classified as dangerous, an explicit
+   * `confirmed: true` must be passed. This pushes the safety gate down
+   * to the state machine itself, preventing accidental activation.
+   */
+  setMode(mode: ApprovalMode, confirmed: boolean = false): void {
     this.assertValidMode(mode);
+
     // No-op when unchanged, to avoid spurious listener notifications.
     if (mode === this._mode) return;
+
+    if (isDangerousMode(mode) && !confirmed) {
+      throw new Error(
+        `${LOG_PREFIX} Activating dangerous mode "${mode}" requires explicit confirmation (confirmed=true).`,
+      );
+    }
+
     this._mode = mode;
     this.notifyListeners(mode);
   }
 
-  /** Cycles to the next mode in `ALL_MODES` order and returns it. */
-  cycleMode(): ApprovalMode {
+  /**
+   * Cycles to the next mode in `ALL_MODES` order and returns it.
+   * Requires confirmation if cycling INTO a dangerous mode.
+   */
+  cycleMode(confirmed: boolean = false): ApprovalMode {
     const next = getNextMode(this._mode);
-    this.setMode(next);
+    this.setMode(next, confirmed);
     return next;
   }
 
@@ -173,9 +192,14 @@ export class ModeManager {
   /**
    * Notifies listeners, isolating failures so one broken listener can't
    * prevent others from receiving the update.
+   *
+   * Reliability: We iterate over a snapshot (Array.from) of the listeners
+   * Set. This prevents "Concurrent Modification" exceptions if a listener
+   * dynamically subscribes/unsubscribes other listeners during iteration.
    */
   private notifyListeners(mode: ApprovalMode): void {
-    for (const listener of this._listeners) {
+    const listenersSnapshot = Array.from(this._listeners);
+    for (const listener of listenersSnapshot) {
       try {
         listener(mode);
       } catch (err) {

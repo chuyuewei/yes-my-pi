@@ -9,9 +9,13 @@
 #   - Within a single scope's `rules` array: FIRST MATCH WINS.
 #     Rule order matters — more specific rules MUST come before more
 #     general ones that could also match the same command.
-#   - Pattern syntax: NO wildcard = exact match only. Use `*` (matches
-#     anything except `/` — no path-awareness in bash commands), or
-#     `**` for multi-segment glob on file paths.
+#   - Pattern syntax:
+#       NO wildcard  = exact match only.
+#       "*"          = matches any sequence. For bash commands, it crosses
+#                      spaces and slashes (e.g. "git push*--force*" catches
+#                      args in any order). For file paths, it does not cross
+#                      "/" (single segment).
+#       "**"         = multi-segment glob (crosses "/" in file paths).
 #
 # This file is the factory default. Override it via:
 #   - Project scope: <project>/.pi/permissions.yaml
@@ -19,11 +23,11 @@
 #
 # ⚠️ Ordering warning: when adding new `allow` rules for a tool/command
 # family, double-check no destructive sub-command of that same family
-# (e.g. `git branch -D`, `git tag -d`) would also match your pattern.
+# would also match your pattern.
 # ─────────────────────────────────────────────────────────────
 
 version: 1
-defaultAction: ask  # No rule matched → require user confirmation
+defaultAction: ask # No rule matched → require user confirmation
 
 rules:
   # ── Read-only tools: always allowed ──────────────────────
@@ -52,21 +56,17 @@ rules:
 
   # Destructive git sub-commands that would otherwise be swallowed by
   # a broader "safe git command" allow-rule below. Listed first on
-  # purpose.
+  # purpose. Using inline `*` to catch flags regardless of arg order.
   - tool: bash
     match:
       command:
-        - "git branch -d*"
-        - "git branch -D*"
-        - "git tag -d*"
-        - "git clean -f*"
-        - "git clean -d*"
-        - "git clean -x*"
-        - "git clean -fd*"
-        - "git clean -fdx*"
-        - "git push --force*"
-        - "git push -f*"
-        - "git push --force-with-lease*"
+        - "git branch*-d*"
+        - "git branch*-D*"
+        - "git tag*-d*"
+        - "git clean*" # Any variant of git clean is potentially destructive
+        - "git push*--force*"
+        - "git push*-f *"
+        - "git push*--force-with-lease*"
     action: ask
     reason: "Destructive or irreversible git operation — please confirm"
 
@@ -120,29 +120,28 @@ rules:
   # High-risk commands: hard-denied in ALL modes.
   # Mirrors bash-analyzer.ts's DANGEROUS_COMMANDS for defense-in-depth
   # (explicit rules give a clearer `reason` than the generic
-  # classifier fallback).
+  # classifier fallback). Using inline `*` to catch arg order variants.
   - tool: bash
     match:
       command:
         - "rm -rf /"
         - "rm -rf /*"
+        - "rm -fr /"
+        - "rm -fr /*"
+        - "rm --recursive --force /"
+        - "rm --recursive --force /*"
         - "rm -rf ~"
         - "rm -rf ~/"
         - "sudo *"
         - "su *"
-        # curl/wget piped into a shell — with and without spaces
-        - "curl * | bash*"
-        - "curl * | sh*"
-        - "curl *|bash*"
-        - "curl *|sh*"
-        - "wget * | bash*"
-        - "wget * | sh*"
-        - "wget *|bash*"
-        - "wget *|sh*"
-        - "chmod 777*"
-        - "chmod -R 777*"
-        - "chown -R*"
-        - "dd if=*"
+        # curl/wget piped into a shell — catches all spacing combinations
+        - "curl*|*bash*"
+        - "curl*|*sh*"
+        - "wget*|*bash*"
+        - "wget*|*sh*"
+        - "chmod*777*"
+        - "chown*-R*"
+        - "dd*if=*"
         - "mkfs*"
         - ":(){ :|:& };:*"
         - "> /dev/sda*"
@@ -151,7 +150,7 @@ rules:
         - "reboot*"
         - "halt*"
         - "poweroff*"
-        - "kill -9 1"
+        - "kill*-9 1"
         - "killall *"
         - "iptables *"
         - "ufw *"
@@ -186,7 +185,7 @@ rules:
     match:
       command:
         - "npm install*"
-        - "npm i *"
+        - "npm i*" # Catches "npm i", "npm i -S", "npm init", etc.
         - "npm ci*"
         - "npm uninstall*"
         - "npm remove*"
@@ -257,12 +256,13 @@ rules:
   - tool: bash
     match:
       command:
-        - "format *"
-        - "del /s /q *"
-        - "rd /s /q *"
-        - "Remove-Item -Recurse -Force C:*"
+        - "format*"
+        - "del*/s*"
+        - "del*/q*"
+        - "rd*/s*"
+        - "Remove-Item*C:*" # Catches Remove-Item targeting C: drive in any arg order
         - "diskpart*"
-        - "reg delete *"
+        - "reg delete*"
         - "Stop-Computer*"
         - "Restart-Computer*"
     action: deny
