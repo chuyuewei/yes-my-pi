@@ -7,10 +7,16 @@
  *   - Deny Floor:          A 'deny' in ANY scope is an absolute floor.
  *   - Cascading Override:  project > global > default (first-match-wins).
  *   - Fallback chain:      YAML rule -> bash classifier -> tool registry -> defaultAction
+ *
+ * v2 changes (Maintainability Refactor):
+ *   - Reduced Cognitive Complexity of evaluateToolCall by extracting
+ *     collectScopedConfigs, findDenyMatch, findCascadingMatch, and
+ *     resolveFallbackAction into single-purpose helper functions.
  */
 
 import {
   type MatchResult,
+  type PermissionAction,
   type PermissionConfig,
   type PermissionRule,
   type ToolCallInfo,
@@ -164,6 +170,83 @@ function evaluateToolRegistry(call: ToolCallInfo): MatchResult | undefined {
   }
 }
 
+// ── evaluateToolCall helpers ──────────────────────────────
+//
+// Each helper below owns exactly one "pass" of the resolution model
+// documented on evaluateToolCall. Splitting them out keeps every
+// function's cognitive complexity low: no function combines more than
+// one loop with more than one level of conditional nesting.
+
+interface ScopedConfig {
+  scope: MatchResult["scope"];
+  config: PermissionConfig;
+}
+
+interface ToolCallConfigs {
+  project?: PermissionConfig;
+  global?: PermissionConfig;
+  default?: PermissionConfig;
+}
+
+/** Collects present configs in cascade priority order: project > global > default. */
+function collectScopedConfigs(configs: ToolCallConfigs): ScopedConfig[] {
+  const scopes: ScopedConfig[] = [];
+  if (configs.project)
+    scopes.push({ scope: "project", config: configs.project });
+  if (configs.global) scopes.push({ scope: "global", config: configs.global });
+  if (configs.default)
+    scopes.push({ scope: "default", config: configs.default });
+  return scopes;
+}
+
+/**
+ * Pass 1: deny is an absolute floor across ALL scopes. Returns the first
+ * matching `deny` rule found (scanning scopes in priority order), or
+ * undefined if no scope has a matching deny rule.
+ */
+function findDenyMatch(
+  scopes: ScopedConfig[],
+  call: ToolCallInfo,
+): MatchResult | undefined {
+  for (const { scope, config } of scopes) {
+    const denyRule = config.rules.find(
+      (rule) => rule.action === "deny" && matchRule(rule, call),
+    );
+    if (denyRule) {
+      return { action: "deny", rule: denyRule, scope, reason: denyRule.reason };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Pass 2: cascading override for non-deny actions. Scopes are checked in
+ * priority order (project -> global -> default); within a scope, the
+ * first matching rule wins.
+ */
+function findCascadingMatch(
+  scopes: ScopedConfig[],
+  call: ToolCallInfo,
+): MatchResult | undefined {
+  for (const { scope, config } of scopes) {
+    const rule = config.rules.find((r) => matchRule(r, call));
+    if (rule) {
+      return { action: rule.action, rule, scope, reason: rule.reason };
+    }
+  }
+  return undefined;
+}
+
+/** Pass 4: defaultAction fallback, project overrides global overrides default. */
+function resolveFallbackAction(configs: ToolCallConfigs): PermissionAction {
+  return (
+    configs.project?.defaultAction ??
+    configs.global?.defaultAction ??
+    configs.default?.defaultAction ??
+    "ask"
+  );
+}
+
 /**
  * Evaluate a tool call against all configured scopes + falls-through classifiers.
  *
@@ -175,53 +258,21 @@ function evaluateToolRegistry(call: ToolCallInfo): MatchResult | undefined {
  */
 export function evaluateToolCall(
   call: ToolCallInfo,
-  configs: {
-    project?: PermissionConfig;
-    global?: PermissionConfig;
-    default?: PermissionConfig;
-  },
+  configs: ToolCallConfigs,
 ): MatchResult {
-  const scopes: Array<{
-    scope: MatchResult["scope"];
-    config: PermissionConfig;
-  }> = [];
-  if (configs.project)
-    scopes.push({ scope: "project", config: configs.project });
-  if (configs.global) scopes.push({ scope: "global", config: configs.global });
-  if (configs.default)
-    scopes.push({ scope: "default", config: configs.default });
+  const scopes = collectScopedConfigs(configs);
 
-  // Pass 1: Deny floor — checked across ALL scopes before anything else.
-  for (const { scope, config } of scopes) {
-    for (const rule of config.rules) {
-      if (rule.action === "deny" && matchRule(rule, call)) {
-        return { action: "deny", rule, scope, reason: rule.reason };
-      }
-    }
-  }
+  const denyMatch = findDenyMatch(scopes, call);
+  if (denyMatch) return denyMatch;
 
-  // Pass 2: Cascading first-match-wins per scope, in priority order.
-  for (const { scope, config } of scopes) {
-    for (const rule of config.rules) {
-      if (matchRule(rule, call)) {
-        return { action: rule.action, rule, scope, reason: rule.reason };
-      }
-    }
-  }
+  const cascadingMatch = findCascadingMatch(scopes, call);
+  if (cascadingMatch) return cascadingMatch;
 
-  // Pass 3: Dynamic fallbacks (Bash classifier & Tool registry)
   const bashResult = evaluateBashClassifier(call);
   if (bashResult) return bashResult;
 
   const registryResult = evaluateToolRegistry(call);
   if (registryResult) return registryResult;
 
-  // Pass 4: defaultAction fallback (project overrides global overrides default)
-  const fallbackAction =
-    configs.project?.defaultAction ??
-    configs.global?.defaultAction ??
-    configs.default?.defaultAction ??
-    "ask";
-
-  return { action: fallbackAction, scope: "default" };
+  return { action: resolveFallbackAction(configs), scope: "default" };
 }

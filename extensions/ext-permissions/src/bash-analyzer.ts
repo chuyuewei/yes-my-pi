@@ -1,23 +1,23 @@
 /**
- * yes-my-pi Permission System — Bash Command Classifier (v6)
+ * yes-my-pi Permission System — Bash Command Classifier (v7)
+ *
+ * v7 changes (Maintainability Refactor):
+ *   - Reduced Cognitive Complexity of splitCommandSegments and
+ *     extractNestedCommands by extracting shared quote/escape state
+ *     machine logic (updateQuoteState) and operator/regex matching
+ *     into small, single-purpose helper functions.
  *
  * v6 changes (ReDoS Security Fix):
  *   - Fixed stripEnvPrefix: replaced the nested-quantifier regex
- *     `/^(?:\s*\w+=\S+\s+)+/` (vulnerable to exponential backtracking)
- *     with a `while` loop driven by a single-assignment regex. This
- *     guarantees linear time complexity and also adds support for
- *     quoted values (e.g., `FOO="a b" cmd`).
+ *     with a `while` loop driven by a single-assignment regex.
  *
  * v5 changes (ReDoS Security Fix):
  *   - Replaced the vulnerable glob regex compiler with a ReDoS-safe
- *     implementation (compileSafeGlob). It accumulates literal characters
- *     and builds negated character classes, eliminating exponential
- *     backtracking on overlapping wildcards (e.g., "*a*b*c").
+ *     implementation (compileSafeGlob).
  *
  * v4 changes (Performance, Security, Reliability):
- *   - Compiles prefix lists into single optimized regexes (O(N) -> O(1) lookup).
+ *   - Compiles prefix lists into single optimized regexes.
  *   - Uses word-boundary assertions for command matching.
- *   - State-machine parser for extractNestedCommands, handling infinite depth.
  *   - Extended splitCommandSegments to cover "&" and newlines.
  */
 
@@ -453,7 +453,78 @@ function matchStringOrArray(
   return patterns.some((p) => matchPattern(p, value, options));
 }
 
-// ── Command Parsing & Extraction ─────────────────────────
+// ── Shared Quote/Escape State Machine ────────────────────
+//
+// Both splitCommandSegments and extractNestedCommands need to track
+// whether the parser is currently inside a single/double-quoted string
+// (so operators like |, &, ; or subshell markers $( inside a quoted
+// string literal are NOT treated as syntax). This shared helper avoids
+// duplicating that state machine in two places, and keeps each caller's
+// main loop simple (lower cognitive complexity).
+
+interface QuoteState {
+  inSingle: boolean;
+  inDouble: boolean;
+  escaped: boolean;
+}
+
+function createQuoteState(): QuoteState {
+  return { inSingle: false, inDouble: false, escaped: false };
+}
+
+/**
+ * Feeds one character into the quote/escape state machine.
+ *
+ * Returns `true` if the character was "consumed" by quote/escape handling
+ * (i.e. it's a backslash, or a quote character that toggled state) and the
+ * caller should treat it as literal content rather than syntax. Returns
+ * `false` for any other character, meaning the caller should apply its own
+ * syntax rules (e.g. operator detection) — but only when NOT currently
+ * inside a quoted string (see `isInsideQuotes`).
+ */
+function updateQuoteState(state: QuoteState, ch: string): boolean {
+  if (state.escaped) {
+    state.escaped = false;
+    return true;
+  }
+  if (ch === "\\") {
+    state.escaped = true;
+    return true;
+  }
+  if (ch === "'" && !state.inDouble) {
+    state.inSingle = !state.inSingle;
+    return true;
+  }
+  if (ch === '"' && !state.inSingle) {
+    state.inDouble = !state.inDouble;
+    return true;
+  }
+  return false;
+}
+
+function isInsideQuotes(state: QuoteState): boolean {
+  return state.inSingle || state.inDouble;
+}
+
+// ── Command Segment Splitting ─────────────────────────────
+
+/**
+ * Length of the shell separator operator starting at position `i`, or 0
+ * if there isn't one. Handles the two-character operators (`||`, `&&`)
+ * before the single-character ones (`|`, `&`, `;`, newline).
+ */
+function matchSeparatorLength(command: string, i: number): number {
+  const ch = command[i];
+  const next = command[i + 1];
+
+  if ((ch === "|" && next === "|") || (ch === "&" && next === "&")) {
+    return 2;
+  }
+  if (ch === "|" || ch === "&" || ch === ";" || ch === "\n") {
+    return 1;
+  }
+  return 0;
+}
 
 /**
  * Quote & escape aware splitter.
@@ -466,10 +537,8 @@ function matchStringOrArray(
  */
 export function splitCommandSegments(command: string): string[] {
   const segments: string[] = [];
+  const state = createQuoteState();
   let current = "";
-  let inSingle = false;
-  let inDouble = false;
-  let escaped = false;
 
   const pushSegment = () => {
     const trimmed = current.trim();
@@ -479,51 +548,18 @@ export function splitCommandSegments(command: string): string[] {
 
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
-    const next = command[i + 1];
+    const consumedByQuoteHandling = updateQuoteState(state, ch);
 
-    if (escaped) {
-      current += ch;
-      escaped = false;
-      continue;
-    }
-    if (ch === "\\") {
-      current += ch;
-      escaped = true;
-      continue;
-    }
-    if (ch === "'" && !inDouble) {
-      inSingle = !inSingle;
-      current += ch;
-      continue;
-    }
-    if (ch === '"' && !inSingle) {
-      inDouble = !inDouble;
+    if (consumedByQuoteHandling) {
       current += ch;
       continue;
     }
 
-    if (!inSingle && !inDouble) {
-      if (ch === "|" && next === "|") {
+    if (!isInsideQuotes(state)) {
+      const sepLen = matchSeparatorLength(command, i);
+      if (sepLen > 0) {
         pushSegment();
-        i++;
-        continue;
-      }
-      if (ch === "|") {
-        pushSegment();
-        continue;
-      }
-      if (ch === "&" && next === "&") {
-        pushSegment();
-        i++;
-        continue;
-      }
-      if (ch === "&") {
-        // background execution separator
-        pushSegment();
-        continue;
-      }
-      if (ch === ";" || ch === "\n") {
-        pushSegment();
+        i += sepLen - 1; // -1 because the for-loop will also increment
         continue;
       }
     }
@@ -535,20 +571,16 @@ export function splitCommandSegments(command: string): string[] {
   return segments;
 }
 
+// ── Nested Command Extraction ─────────────────────────────
+
 /**
- * Extract nested commands using a state machine.
- * Reliably handles infinite nesting depths for $(), <(), >() which regex fails on.
- *
- *   "echo $(rm -rf /)"        -> ["rm -rf /"]
- *   "bash -c 'rm -rf /'"      -> ["rm -rf /"]
- *   "find . -exec rm {} \;"   -> ["rm {}"]
- *   "xargs rm"                -> ["rm"]
+ * Extracts the contents of $(), <(), and >() constructs, correctly
+ * handling arbitrary nesting depth (e.g. `$(echo $(rm -rf /))`).
+ * A regex cannot do this reliably, so we use a small state machine.
  */
-export function extractNestedCommands(command: string): string[] {
+function extractSubshellCommands(command: string): string[] {
   const nested: string[] = [];
-  let inSingle = false,
-    inDouble = false,
-    escaped = false;
+  const state = createQuoteState();
   let depth = 0;
   let start = -1;
 
@@ -556,72 +588,68 @@ export function extractNestedCommands(command: string): string[] {
     const ch = command[i];
     const next = command[i + 1];
 
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (ch === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (ch === "'" && !inDouble) {
-      inSingle = !inSingle;
-      continue;
-    }
-    if (ch === '"' && !inSingle) {
-      inDouble = !inDouble;
-      continue;
-    }
-    if (inSingle || inDouble) continue;
+    const consumed = updateQuoteState(state, ch);
+    if (consumed || isInsideQuotes(state)) continue;
 
     if (depth === 0) {
-      // Detect command substitutions and process substitutions
       if ((ch === "$" || ch === "<" || ch === ">") && next === "(") {
         depth = 1;
         start = i + 2;
-        i++; // consume '('
-        continue;
+        i++; // consume the '(' too
       }
-    } else {
-      if (ch === "(") {
-        depth++;
-        continue;
-      }
-      if (ch === ")") {
-        depth--;
-        if (depth === 0) {
-          nested.push(command.substring(start, i));
-          start = -1;
-        }
-        continue;
+      continue;
+    }
+
+    if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      depth--;
+      if (depth === 0) {
+        nested.push(command.substring(start, i));
+        start = -1;
       }
     }
   }
 
-  // Backticks (do not nest in bash, regex is safe here)
-  const backtickRegex = /`([^`]+)`/g;
-  let match: RegExpExecArray | null;
-  while ((match = backtickRegex.exec(command)) !== null) {
-    nested.push(match[1]);
-  }
-
-  const shellCRegex =
-    /(?:bash|sh|zsh|cmd|powershell|pwsh)\s+(?:-\w+\s+)*-c\s+["']?([^"']+)["']?/gi;
-  while ((match = shellCRegex.exec(command)) !== null) {
-    nested.push(match[1]);
-  }
-
-  const findExecRegex = /-exec\s+(.+?)(?:\s*\\;|\s*;|\s*\\+\s*)/g;
-  while ((match = findExecRegex.exec(command)) !== null) {
-    nested.push(match[1]);
-  }
-
-  const xargsRegex = /xargs\s+(?:-\w+\s+)*(\S+)/g;
-  while ((match = xargsRegex.exec(command)) !== null) {
-    nested.push(match[1]);
-  }
-
   return nested;
+}
+
+/** Runs a global-flag regex against `command` and collects all group-1 captures. */
+function extractByRegex(command: string, regex: RegExp): string[] {
+  const nested: string[] = [];
+  // Clone the regex so callers' shared `RegExp.lastIndex` state can't leak
+  // between invocations.
+  const re = new RegExp(regex.source, regex.flags);
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(command)) !== null) {
+    nested.push(match[1]);
+  }
+  return nested;
+}
+
+const BACKTICK_REGEX = /`([^`]+)`/g;
+const SHELL_C_REGEX =
+  /(?:bash|sh|zsh|cmd|powershell|pwsh)\s+(?:-\w+\s+)*-c\s+["']?([^"']+)["']?/gi;
+const FIND_EXEC_REGEX = /-exec\s+(.+?)(?:\s*\\;|\s*;|\s*\\+\s*)/g;
+const XARGS_REGEX = /xargs\s+(?:-\w+\s+)*(\S+)/g;
+
+/**
+ * Extract nested commands (command substitution, subshells, -c args,
+ * find -exec, xargs).
+ *
+ *   "echo $(rm -rf /)"        -> ["rm -rf /"]
+ *   "bash -c 'rm -rf /'"      -> ["rm -rf /"]
+ *   "find . -exec rm {} \;"   -> ["rm {}"]
+ *   "xargs rm"                -> ["rm"]
+ */
+export function extractNestedCommands(command: string): string[] {
+  return [
+    ...extractSubshellCommands(command),
+    ...extractByRegex(command, BACKTICK_REGEX),
+    ...extractByRegex(command, SHELL_C_REGEX),
+    ...extractByRegex(command, FIND_EXEC_REGEX),
+    ...extractByRegex(command, XARGS_REGEX),
+  ];
 }
 
 // Matches a SINGLE env-var assignment prefix (e.g. "FOO=bar ").
